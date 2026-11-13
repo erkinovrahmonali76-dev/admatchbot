@@ -5,6 +5,7 @@ import os
 import time
 
 import aiosqlite
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -815,10 +816,24 @@ async def _dummy(cb: CallbackQuery):
 
 
 # ---------- Ishga tushirish ----------
+async def start_web():
+    # Render Web Service port ochishni talab qiladi (health-check)
+    app = web.Application()
+
+    async def ok(request):
+        return web.Response(text="OK")
+
+    app.router.add_get("/", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+
+
 async def main():
     if not TOKEN:
         raise SystemExit("BOT_TOKEN topilmadi (.env faylini tekshiring)")
     await init_db()
+    await start_web()
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.outer_middleware(Guard())
     dp.callback_query.outer_middleware(Guard())
