@@ -1,926 +1,831 @@
-"""
-AdMatch Bot PRO  -  Telegram tanishuv boti
-Stack: aiogram 3 + PostgreSQL (asyncpg) + aiohttp (Render Web Service uchun)
-
-Muhit o'zgaruvchilari (Render -> Environment):
-  BOT_TOKEN     - BotFather tokeni                       (majburiy)
-  DATABASE_URL  - Postgres manzili                       (majburiy)
-  ADMIN_IDS     - admin Telegram ID lari, vergul bilan   (masalan 12345,67890)
-  CHANNEL       - majburiy obuna kanali, masalan @kanal  (ixtiyoriy)
-  DAILY_LIKES   - bepul foydalanuvchi uchun kunlik layk  (standart 30)
-  VIP_CONTACT   - VIP uchun yoziladigan akkaunt          (masalan @admin)
-"""
 import asyncio
-import csv
 import html
-import io
 import logging
 import os
-import re
 import time
-from datetime import datetime, timedelta, timezone
 
-import asyncpg
-from aiohttp import ClientSession, web
+import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from dotenv import load_dotenv
 
-# ====================== SOZLAMALAR ======================
-TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
-CHANNEL = os.getenv("CHANNEL", "").strip()
-DAILY_LIKES = int(os.getenv("DAILY_LIKES", "30"))
-VIP_CONTACT = os.getenv("VIP_CONTACT", "@admin")
-PORT = int(os.getenv("PORT", "10000"))
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN", "")
+ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+FREE_LIKES = int(os.getenv("FREE_LIKES_PER_DAY", "50"))
+DB_PATH = os.getenv("DB_PATH", "matchbot.db")
 
-pool: asyncpg.Pool = None
-router = Router()
-admin = Router()
-esc = html.escape
+logging.basicConfig(level=logging.INFO)
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+db: aiosqlite.Connection = None  # type: ignore
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(
-    id BIGINT PRIMARY KEY,
-    username TEXT,
-    name TEXT, gender TEXT, age INT, city TEXT,
-    photo TEXT, interests TEXT,
-    is_active BOOLEAN DEFAULT TRUE,
-    is_banned BOOLEAN DEFAULT FALSE,
-    vip_until TIMESTAMPTZ,
-    min_age INT DEFAULT 16,
-    max_age INT DEFAULT 70,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    last_seen TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS reactions(
-    from_id BIGINT, to_id BIGINT, value SMALLINT,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY(from_id, to_id)
-);
-CREATE INDEX IF NOT EXISTS idx_reactions_to ON reactions(to_id, value);
-CREATE TABLE IF NOT EXISTS matches(
-    a BIGINT, b BIGINT, created_at TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY(a, b)
-);
-CREATE TABLE IF NOT EXISTS reports(
-    id SERIAL PRIMARY KEY, from_id BIGINT, to_id BIGINT,
-    created_at TIMESTAMPTZ DEFAULT now(), handled BOOLEAN DEFAULT FALSE
-);
-CREATE TABLE IF NOT EXISTS daily_likes(
-    user_id BIGINT, day DATE, cnt INT DEFAULT 0,
-    PRIMARY KEY(user_id, day)
-);
-CREATE INDEX IF NOT EXISTS idx_users_gender ON users(gender, is_active);
-"""
+# ---------- Matnlar ----------
+B_SEARCH = "🔍 Qidirish"
+B_CHAT = "💬 Suhbat"
+B_LIKES = "💌 Menga kim layk bosdi"
+B_PROFILE = "👤 Mening profilim"
+B_VIP = "💎 VIP PREMIUM"
+B_SAVED = "🔖 Saqlanganlar"
+B_STOP = "❌ Suhbatni tugatish"
+B_NEXT = "⏭ Keyingi suhbatdosh"
+B_CANCEL = "❌ Bekor qilish"
+B_SKIP = "⏭ O'tkazib yuborish"
+
+DEFAULT_VIP_TEXT = (
+    "💎 <b>VIP PREMIUM</b>\n\n"
+    "✅ Sizga kim layk bosganini ko'rasiz\n"
+    "✅ Anketangiz qidiruvda birinchi ko'rsatiladi\n"
+    "✅ Kunlik layk limiti yo'q\n\n"
+    "Sotib olish uchun admin bilan bog'laning."
+)
+
+pairs: dict[int, int] = {}
+waiting: list[int] = []
+notify_ts: dict[int, float] = {}
 
 
-# ====================== DB YORDAMCHILARI ======================
+def esc(s) -> str:
+    return html.escape(str(s or ""))
+
+
+# ---------- DB ----------
+async def q1(sql, args=()):
+    cur = await db.execute(sql, args)
+    row = await cur.fetchone()
+    await cur.close()
+    return row
+
+
+async def qa(sql, args=()):
+    cur = await db.execute(sql, args)
+    rows = await cur.fetchall()
+    await cur.close()
+    return rows
+
+
+async def ex(sql, args=()):
+    await db.execute(sql, args)
+    await db.commit()
+
+
+async def init_db():
+    global db
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY, username TEXT, name TEXT, age INTEGER,
+            gender TEXT, looking TEXT DEFAULT 'all', city TEXT, interests TEXT,
+            bio TEXT, photo TEXT, active INTEGER DEFAULT 1, banned INTEGER DEFAULT 0,
+            vip_until INTEGER DEFAULT 0, created INTEGER);
+        CREATE TABLE IF NOT EXISTS views(
+            from_id INTEGER, to_id INTEGER, action TEXT, created INTEGER,
+            PRIMARY KEY(from_id, to_id));
+        CREATE TABLE IF NOT EXISTS saved(
+            user_id INTEGER, target_id INTEGER, PRIMARY KEY(user_id, target_id));
+        CREATE TABLE IF NOT EXISTS reports(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, target_id INTEGER,
+            created INTEGER, handled INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        """
+    )
+    await db.commit()
+
+
+async def get_setting(key, default=None):
+    row = await q1("SELECT value FROM settings WHERE key=?", (key,))
+    return row["value"] if row else default
+
+
+async def set_setting(key, value):
+    await ex(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
 async def get_user(uid):
-    return await pool.fetchrow("SELECT * FROM users WHERE id=$1", uid)
+    return await q1("SELECT * FROM users WHERE id=?", (uid,))
 
 
-def is_vip(u):
-    return bool(u and u["vip_until"] and u["vip_until"] > datetime.now(timezone.utc))
+def is_vip(u) -> bool:
+    return bool(u) and u["vip_until"] > time.time()
 
 
-async def set_reaction(a, b, v):
-    await pool.execute(
-        "INSERT INTO reactions(from_id,to_id,value) VALUES($1,$2,$3) "
-        "ON CONFLICT (from_id,to_id) DO UPDATE SET value=$3, created_at=now()",
-        a, b, v,
-    )
+def profile_text(u) -> str:
+    g = "👨" if u["gender"] == "male" else "👩"
+    vip = " 💎" if is_vip(u) else ""
+    t = f"<b>{esc(u['name'])}</b>, {u['age']}, {esc(u['city'])} {g}{vip}"
+    if u["interests"]:
+        t += f"\n\n🎯 <b>Qiziqishlar:</b> {esc(u['interests'])}"
+    if u["bio"]:
+        t += f"\n\n{esc(u['bio'])}"
+    return t
 
 
-async def like_allowed(uid, me):
-    """VIP cheklovsiz. Boshqalarga kuniga DAILY_LIKES ta."""
-    if is_vip(me):
-        return True
-    cnt = await pool.fetchval(
-        "SELECT cnt FROM daily_likes WHERE user_id=$1 AND day=CURRENT_DATE", uid
-    ) or 0
-    if cnt >= DAILY_LIKES:
-        return False
-    await pool.execute(
-        "INSERT INTO daily_likes(user_id,day,cnt) VALUES($1,CURRENT_DATE,1) "
-        "ON CONFLICT (user_id,day) DO UPDATE SET cnt=daily_likes.cnt+1",
-        uid,
-    )
-    return True
-
-
-async def next_profile(me):
-    return await pool.fetchrow(
-        """
-        SELECT x.* FROM users x
-        WHERE x.gender<>$1 AND x.id<>$2 AND x.is_active AND NOT x.is_banned
-          AND x.age BETWEEN $3 AND $4
-          AND NOT EXISTS (SELECT 1 FROM reactions r WHERE r.from_id=$2 AND r.to_id=x.id)
-        ORDER BY (x.vip_until IS NOT NULL AND x.vip_until>now()) DESC,
-                 (lower(x.city)=lower($5)) DESC,
-                 random()
-        LIMIT 1
-        """,
-        me["gender"], me["id"], me["min_age"], me["max_age"], me["city"],
-    )
-
-
-async def next_liker(uid):
-    return await pool.fetchrow(
-        """
-        SELECT u.* FROM reactions r JOIN users u ON u.id=r.from_id
-        WHERE r.to_id=$1 AND r.value=1 AND NOT u.is_banned
-          AND NOT EXISTS (SELECT 1 FROM reactions q WHERE q.from_id=$1 AND q.to_id=r.from_id)
-        ORDER BY r.created_at DESC LIMIT 1
-        """,
-        uid,
-    )
-
-
-async def delete_user_data(uid):
-    await pool.execute("DELETE FROM reactions WHERE from_id=$1 OR to_id=$1", uid)
-    await pool.execute("DELETE FROM matches WHERE a=$1 OR b=$1", uid)
-    await pool.execute("DELETE FROM daily_likes WHERE user_id=$1", uid)
-    await pool.execute("DELETE FROM users WHERE id=$1", uid)
-
-
-# ====================== KLAVIATURALAR / MATN ======================
-def main_menu(uid):
-    rows = [
-        [KeyboardButton(text="🔍 Qidirish"), KeyboardButton(text="💌 Menga kim layk bosdi")],
-        [KeyboardButton(text="👤 Mening profilim"), KeyboardButton(text="⚙️ Sozlamalar")],
-        [KeyboardButton(text="👑 VIP PREMIUM")],
-    ]
-    if uid in ADMIN_IDS:
-        rows.append([KeyboardButton(text="🛠 Admin panel")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-
-def gender_kb():
+# ---------- Klaviaturalar ----------
+def rk(rows, one_time=False):
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="👨 Yigit"), KeyboardButton(text="👩 Qiz")]],
-        resize_keyboard=True, one_time_keyboard=True,
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        one_time_keyboard=one_time,
     )
 
 
-def react_kb(target_id, src):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❤️", callback_data=f"lk:{target_id}:{src}"),
-            InlineKeyboardButton(text="👎", callback_data=f"ds:{target_id}:{src}"),
-        ],
-        [
-            InlineKeyboardButton(text="🚩 Shikoyat", callback_data=f"rp:{target_id}:{src}"),
-            InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back"),
-        ],
-    ])
+def main_kb():
+    return rk([[B_SEARCH, B_CHAT], [B_LIKES], [B_PROFILE, B_VIP], [B_SAVED]])
 
 
-def caption(u):
-    icon = "👨" if u["gender"] == "Yigit" else "👩"
-    vip = " 👑" if is_vip(u) else ""
-    return (
-        f"<b>{esc(u['name'])}</b>{vip}, {u['age']}, {esc(u['city'])}, {icon} {u['gender']}\n\n"
-        f"🎯 <b>Qiziqishlar:</b> {esc(u['interests'])}"
+def ik(rows):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
     )
 
 
-def sub_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Kanalga o'tish", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
-        [InlineKeyboardButton(text="✅ Tekshirish", callback_data="chk")],
-    ])
+def card_kb(tid, src):
+    if src == "s":
+        return ik([[("❤️", f"like:{tid}:s"), ("🗑 O'chirish", f"unsave:{tid}:s")]])
+    rows = [[("❤️", f"like:{tid}:{src}"), ("👎", f"skip:{tid}:{src}")]]
+    rows.append([("🔖 Saqlash", f"save:{tid}:{src}"), ("🚨 Shikoyat", f"rep:{tid}:{src}")])
+    rows.append([("⬅️ Orqaga", "back")])
+    return ik(rows)
 
 
-async def subscribed(bot: Bot, uid):
-    if not CHANNEL or uid in ADMIN_IDS:
-        return True
-    try:
-        mem = await bot.get_chat_member(CHANNEL, uid)
-        return mem.status in ("member", "administrator", "creator")
-    except Exception:
-        return True  # kanal noto'g'ri sozlangan bo'lsa botni to'xtatmaymiz
-
-
-async def gate(bot: Bot, uid, chat_id):
-    me = await get_user(uid)
-    if not me:
-        await bot.send_message(chat_id, "Avval /start bosib anketa to'ldiring.")
-        return None
-    if not await subscribed(bot, uid):
-        await bot.send_message(
-            chat_id, "📢 Botdan foydalanish uchun kanalimizga obuna bo'ling:", reply_markup=sub_kb()
-        )
-        return None
-    return me
-
-
-# ====================== MIDDLEWARE (ban + flood) ======================
+# ---------- Middleware: ban + majburiy obuna ----------
 class Guard(BaseMiddleware):
-    def __init__(self):
-        self.last = {}
-
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if user:
-            now = time.monotonic()
-            if now - self.last.get(user.id, 0) < 0.3:
-                if isinstance(event, CallbackQuery):
-                    await event.answer()
-                return
-            self.last[user.id] = now
-            row = await pool.fetchrow(
-                "UPDATE users SET last_seen=now() WHERE id=$1 RETURNING is_banned", user.id
-            )
-            if row and row["is_banned"] and user.id not in ADMIN_IDS:
-                if isinstance(event, CallbackQuery):
-                    await event.answer("🚫 Siz bloklangansiz.", show_alert=True)
+        if not user or user.id in ADMINS:
+            return await handler(event, data)
+        row = await q1("SELECT banned FROM users WHERE id=?", (user.id,))
+        if row and row["banned"]:
+            return
+        ch = await get_setting("channel")
+        if ch and not (isinstance(event, CallbackQuery) and event.data == "chk"):
+            try:
+                m = await bot.get_chat_member(ch, user.id)
+                ok = m.status in ("member", "administrator", "creator")
+            except Exception:
+                ok = True
+            if not ok:
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="📢 Kanalga o'tish", url=f"https://t.me/{ch.lstrip('@')}")],
+                        [InlineKeyboardButton(text="✅ Tekshirish", callback_data="chk")],
+                    ]
+                )
+                txt = "Botdan foydalanish uchun kanalimizga obuna bo'ling 👇"
+                if isinstance(event, Message):
+                    await event.answer(txt, reply_markup=kb)
                 else:
-                    await event.answer("🚫 Siz bloklangansiz.")
+                    await event.answer("Avval kanalga obuna bo'ling!", show_alert=True)
                 return
         return await handler(event, data)
 
 
-class IsAdmin(BaseFilter):
-    async def __call__(self, event) -> bool:
-        return bool(event.from_user and event.from_user.id in ADMIN_IDS)
-
-
-admin.message.filter(IsAdmin())
-admin.callback_query.filter(IsAdmin())
-
-
-# ====================== RO'YXATDAN O'TISH ======================
+# ---------- Ro'yxatdan o'tish ----------
 class Reg(StatesGroup):
     name = State()
-    gender = State()
     age = State()
+    gender = State()
+    looking = State()
     city = State()
-    photo = State()
     interests = State()
+    bio = State()
+    photo = State()
 
 
-class SetAge(StatesGroup):
-    rng = State()
+r = Router()
 
 
-@router.message(CommandStart())
-async def start(m: Message, state: FSMContext, bot: Bot):
+async def begin_reg(msg: Message, state: FSMContext, first_name: str):
     await state.clear()
-    await m.answer(
-        "👋 <b>AdMatch Bot</b>ga xush kelibsiz!\n\n"
-        "Bu yerda yangi insonlar bilan tanishishingiz mumkin.\n\n"
-        "❤️ Layk bosing: agar u ham yoqtirsa, match bo'ladi\n"
-        "👎 Yoqmasa: o'tkazib yuboring\n\n"
-        "Tanishuvni hoziroq boshlang!"
-    )
-    if await get_user(m.from_user.id):
-        if not await subscribed(bot, m.from_user.id):
-            return await m.answer("📢 Avval kanalga obuna bo'ling:", reply_markup=sub_kb())
-        await m.answer("Menyudan tanlang 👇", reply_markup=main_menu(m.from_user.id))
-    else:
-        await begin_reg(m, state)
-
-
-async def begin_reg(m: Message, state: FSMContext):
-    await m.answer("Anketa to'ldiramiz.\n\n✏️ Ismingiz?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Reg.name)
+    await msg.answer("📝 Anketa to'ldiramiz.\n\nIsmingiz nima?", reply_markup=rk([[first_name[:30]]]))
 
 
-@router.message(Reg.name, F.text)
-async def reg_name(m: Message, state: FSMContext):
-    name = m.text.strip()
-    if not 2 <= len(name) <= 30:
-        return await m.answer("Ism 2 dan 30 ta belgigacha bo'lsin.")
-    await state.update_data(name=name)
-    await m.answer("Jinsingiz?", reply_markup=gender_kb())
-    await state.set_state(Reg.gender)
-
-
-@router.message(Reg.gender, F.text)
-async def reg_gender(m: Message, state: FSMContext):
-    t = m.text.lower()
-    if "yigit" in t:
-        g = "Yigit"
-    elif "qiz" in t:
-        g = "Qiz"
+@r.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    if m.from_user.id in waiting:
+        waiting.remove(m.from_user.id)
+    u = await get_user(m.from_user.id)
+    if u and u["photo"]:
+        await ex("UPDATE users SET username=? WHERE id=?", (m.from_user.username, m.from_user.id))
+        await m.answer("🎯 <b>Ola Match Bot</b>ga xush kelibsiz!\n\n"
+                       "❤️ Layk bosing — agar u ham yoqsa, match bo'ladi\n"
+                       "👎 Yoqmasa — o'tkazib yuboring\n\nTanishuvni hoziroq boshlang 👇",
+                       reply_markup=main_kb())
     else:
-        return await m.answer("Tugmalardan birini tanlang 👇", reply_markup=gender_kb())
-    await state.update_data(gender=g)
-    await m.answer("Yoshingiz?", reply_markup=ReplyKeyboardRemove())
+        await m.answer("👋 Salom! Bu yerda yangi insonlar bilan tanishishingiz mumkin.")
+        await begin_reg(m, state, m.from_user.first_name or "Ism")
+
+
+@r.message(Reg.name, F.text)
+async def reg_name(m: Message, state: FSMContext):
+    if not 2 <= len(m.text) <= 30:
+        return await m.answer("Ism 2-30 ta belgi bo'lsin.")
+    await state.update_data(name=m.text.strip())
     await state.set_state(Reg.age)
+    await m.answer("Yoshingiz nechada?", reply_markup=ReplyKeyboardRemove())
 
 
-@router.message(Reg.age, F.text)
+@r.message(Reg.age, F.text)
 async def reg_age(m: Message, state: FSMContext):
     if not m.text.isdigit() or not 16 <= int(m.text) <= 70:
-        return await m.answer("Yoshni raqam bilan yozing (16-70).")
+        return await m.answer("Yoshni raqam bilan kiriting (16-70).")
     await state.update_data(age=int(m.text))
-    await m.answer("Qaysi shahardansiz?")
+    await state.set_state(Reg.gender)
+    await m.answer("Jinsingiz?", reply_markup=rk([["👨 Yigit", "👩 Qiz"]]))
+
+
+@r.message(Reg.gender, F.text.in_({"👨 Yigit", "👩 Qiz"}))
+async def reg_gender(m: Message, state: FSMContext):
+    await state.update_data(gender="male" if "Yigit" in m.text else "female")
+    await state.set_state(Reg.looking)
+    await m.answer("Kimni qidiryapsiz?", reply_markup=rk([["👨 Yigitlar", "👩 Qizlar"], ["👥 Hammasi"]]))
+
+
+@r.message(Reg.looking, F.text.in_({"👨 Yigitlar", "👩 Qizlar", "👥 Hammasi"}))
+async def reg_looking(m: Message, state: FSMContext):
+    v = {"👨 Yigitlar": "male", "👩 Qizlar": "female", "👥 Hammasi": "all"}[m.text]
+    await state.update_data(looking=v)
     await state.set_state(Reg.city)
+    await m.answer("Qaysi shaharda yashaysiz?", reply_markup=ReplyKeyboardRemove())
 
 
-@router.message(Reg.city, F.text)
+@r.message(Reg.city, F.text)
 async def reg_city(m: Message, state: FSMContext):
-    city = m.text.strip()
-    if not 2 <= len(city) <= 30:
-        return await m.answer("Shahar nomini to'g'ri yozing.")
-    await state.update_data(city=city)
-    await m.answer("📸 Rasmingizni yuboring:")
-    await state.set_state(Reg.photo)
-
-
-@router.message(Reg.photo, F.photo)
-async def reg_photo(m: Message, state: FSMContext):
-    await state.update_data(photo=m.photo[-1].file_id)
-    await m.answer("🎯 Qiziqishlaringiz? (masalan: Biznes, Avtomobillar, Sport)")
+    await state.update_data(city=m.text.strip()[:40])
     await state.set_state(Reg.interests)
+    await m.answer("Qiziqishlaringiz? (masalan: Sport, Musiqa, Sayohat)")
 
 
-@router.message(Reg.photo)
+@r.message(Reg.interests, F.text)
+async def reg_interests(m: Message, state: FSMContext):
+    await state.update_data(interests=m.text.strip()[:100])
+    await state.set_state(Reg.bio)
+    await m.answer("O'zingiz haqingizda qisqacha yozing:", reply_markup=rk([[B_SKIP]]))
+
+
+@r.message(Reg.bio, F.text)
+async def reg_bio(m: Message, state: FSMContext):
+    await state.update_data(bio="" if m.text == B_SKIP else m.text.strip()[:300])
+    await state.set_state(Reg.photo)
+    await m.answer("📸 Endi rasmingizni yuboring:", reply_markup=ReplyKeyboardRemove())
+
+
+@r.message(Reg.photo, F.photo)
+async def reg_photo(m: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    await ex(
+        """INSERT INTO users(id,username,name,age,gender,looking,city,interests,bio,photo,created)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET username=excluded.username,name=excluded.name,
+           age=excluded.age,gender=excluded.gender,looking=excluded.looking,city=excluded.city,
+           interests=excluded.interests,bio=excluded.bio,photo=excluded.photo,active=1""",
+        (m.from_user.id, m.from_user.username, d["name"], d["age"], d["gender"], d["looking"],
+         d["city"], d["interests"], d["bio"], m.photo[-1].file_id, int(time.time())),
+    )
+    await m.answer("✅ Anketa saqlandi!", reply_markup=main_kb())
+    u = await get_user(m.from_user.id)
+    await m.answer_photo(u["photo"], caption=profile_text(u))
+
+
+@r.message(StateFilter(Reg.photo))
 async def reg_photo_bad(m: Message):
     await m.answer("Iltimos, rasm yuboring 📸")
 
 
-@router.message(Reg.interests, F.text)
-async def reg_interests(m: Message, state: FSMContext):
-    d = await state.get_data()
-    await pool.execute(
-        """
-        INSERT INTO users(id,username,name,gender,age,city,photo,interests)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-        ON CONFLICT (id) DO UPDATE SET username=$2,name=$3,gender=$4,age=$5,
-            city=$6,photo=$7,interests=$8,is_active=TRUE
-        """,
-        m.from_user.id, m.from_user.username, d["name"], d["gender"], d["age"],
-        d["city"], d["photo"], m.text.strip()[:100],
-    )
-    await state.clear()
-    await m.answer("✅ Anketa saqlandi!", reply_markup=main_menu(m.from_user.id))
-    await show_profile(m, m.from_user.id)
+# ---------- Qidirish ----------
+async def next_candidate(me):
+    sql = """SELECT * FROM users WHERE id!=? AND active=1 AND banned=0 AND photo IS NOT NULL
+             AND (?='all' OR gender=?) AND (looking='all' OR looking=?)
+             AND id NOT IN (SELECT to_id FROM views WHERE from_id=?)
+             ORDER BY (vip_until>?) DESC, RANDOM() LIMIT 1"""
+    return await q1(sql, (me["id"], me["looking"], me["looking"], me["gender"], me["id"], int(time.time())))
 
 
-# ====================== PROFIL ======================
-async def show_profile(m: Message, uid):
-    u = await get_user(uid)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Qayta to'ldirish", callback_data="redo")]
-    ])
-    status = "" if u["is_active"] else "\n\n🙈 <i>Anketangiz yashirilgan</i>"
-    await m.answer_photo(u["photo"], caption=caption(u) + status, reply_markup=kb)
+async def next_liker(uid):
+    sql = """SELECT u.* FROM views v JOIN users u ON u.id=v.from_id
+             WHERE v.to_id=? AND v.action='like' AND u.banned=0 AND u.active=1
+             AND v.from_id NOT IN (SELECT to_id FROM views WHERE from_id=?)
+             ORDER BY v.created DESC LIMIT 1"""
+    return await q1(sql, (uid, uid))
 
 
-@router.message(F.text == "👤 Mening profilim")
-async def my_profile(m: Message, bot: Bot):
-    if await gate(bot, m.from_user.id, m.chat.id):
-        await show_profile(m, m.from_user.id)
-
-
-@router.callback_query(F.data == "redo")
-async def redo(c: CallbackQuery, state: FSMContext):
-    await c.answer()
-    await begin_reg(c.message, state)
-
-
-# ====================== SOZLAMALAR ======================
-def settings_kb(u):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🎂 Qidiruv yoshi: {u['min_age']}-{u['max_age']}", callback_data="st:age")],
-        [InlineKeyboardButton(
-            text="🙈 Anketani yashirish" if u["is_active"] else "👁 Anketani ko'rsatish",
-            callback_data="st:vis")],
-        [InlineKeyboardButton(text="🗑 Akkauntni o'chirish", callback_data="st:del")],
-    ])
-
-
-@router.message(F.text == "⚙️ Sozlamalar")
-async def settings(m: Message, bot: Bot):
-    me = await gate(bot, m.from_user.id, m.chat.id)
-    if me:
-        await m.answer("⚙️ <b>Sozlamalar</b>", reply_markup=settings_kb(me))
-
-
-@router.callback_query(F.data == "st:age")
-async def st_age(c: CallbackQuery, state: FSMContext):
-    await c.answer()
-    await c.message.answer("Qidiruv uchun yosh oralig'ini yozing. Masalan: <code>18-30</code>")
-    await state.set_state(SetAge.rng)
-
-
-@router.message(SetAge.rng, F.text)
-async def st_age_set(m: Message, state: FSMContext):
-    r = re.match(r"^(\d{2})\s*[-–]\s*(\d{2})$", m.text.strip())
-    if not r or not (16 <= int(r[1]) <= int(r[2]) <= 70):
-        return await m.answer("Format noto'g'ri. Masalan: <code>18-30</code> (16 dan 70 gacha).")
-    await pool.execute("UPDATE users SET min_age=$2, max_age=$3 WHERE id=$1",
-                       m.from_user.id, int(r[1]), int(r[2]))
-    await state.clear()
-    await m.answer(f"✅ Endi {r[1]}-{r[2]} yoshdagilar ko'rsatiladi.")
-
-
-@router.callback_query(F.data == "st:vis")
-async def st_vis(c: CallbackQuery):
-    u = await pool.fetchrow(
-        "UPDATE users SET is_active=NOT is_active WHERE id=$1 RETURNING *", c.from_user.id)
-    if not u:
-        return await c.answer("Avval /start bosing", show_alert=True)
-    await c.answer("Anketa ko'rinadi" if u["is_active"] else "Anketa yashirildi")
-    await c.message.edit_reply_markup(reply_markup=settings_kb(u))
-
-
-@router.callback_query(F.data == "st:del")
-async def st_del(c: CallbackQuery):
-    await c.answer()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data="st:delok"),
-        InlineKeyboardButton(text="❌ Yo'q", callback_data="back"),
-    ]])
-    await c.message.answer("⚠️ Anketa va barcha layklaringiz o'chadi. Rostdan o'chiraymi?", reply_markup=kb)
-
-
-@router.callback_query(F.data == "st:delok")
-async def st_delok(c: CallbackQuery):
-    await c.answer()
-    await delete_user_data(c.from_user.id)
-    await c.message.answer("🗑 Akkaunt o'chirildi. Qaytish uchun /start bosing.",
-                           reply_markup=ReplyKeyboardRemove())
-
-
-# ====================== QIDIRUV ======================
-async def send_next(bot: Bot, chat_id, uid):
+async def show_next(uid, src="b"):
     me = await get_user(uid)
-    for _ in range(5):
-        p = await next_profile(me)
-        if not p:
-            return await bot.send_message(
-                chat_id, "😔 Hozircha yangi anketalar yo'q. Keyinroq urinib ko'ring.",
-                reply_markup=main_menu(uid))
-        try:
-            return await bot.send_photo(chat_id, p["photo"], caption=caption(p),
-                                        reply_markup=react_kb(p["id"], "s"))
-        except TelegramBadRequest:
-            await set_reaction(uid, p["id"], 0)  # rasmi buzilgan anketani o'tkazamiz
+    if not me:
+        return await bot.send_message(uid, "Avval /start bosing.")
+    cand = await (next_liker(uid) if src == "l" else next_candidate(me))
+    if not cand:
+        txt = "😔 Hozircha yangi anketalar qolmadi. Keyinroq qaytib keling!"
+        return await bot.send_message(uid, txt, reply_markup=main_kb())
+    await bot.send_photo(uid, cand["photo"], caption=profile_text(cand), reply_markup=card_kb(cand["id"], src))
 
 
-@router.message(F.text == "🔍 Qidirish")
-async def search(m: Message, bot: Bot):
-    if await gate(bot, m.from_user.id, m.chat.id):
-        await send_next(bot, m.chat.id, m.from_user.id)
+@r.message(F.text == B_SEARCH, StateFilter(None))
+async def search(m: Message):
+    await show_next(m.from_user.id)
 
 
-async def show_liker(bot: Bot, chat_id, uid):
-    p = await next_liker(uid)
-    if not p:
-        return await bot.send_message(chat_id, "Hozircha yangi layklar yo'q.",
-                                      reply_markup=main_menu(uid))
-    await bot.send_photo(
-        chat_id, p["photo"],
-        caption="❤️ <b>Sizga shu odam layk bosdi:</b>\n\n" + caption(p),
-        reply_markup=react_kb(p["id"], "l"))
+async def likes_today(uid) -> int:
+    start = int(time.time()) - int(time.time()) % 86400
+    row = await q1("SELECT COUNT(*) c FROM views WHERE from_id=? AND action='like' AND created>=?", (uid, start))
+    return row["c"]
 
 
-@router.message(F.text == "💌 Menga kim layk bosdi")
-async def who_liked(m: Message, bot: Bot):
-    if await gate(bot, m.from_user.id, m.chat.id):
-        await show_liker(bot, m.chat.id, m.from_user.id)
-
-
-async def notify_match(bot: Bot, to_user, other):
-    contact = (f"@{other['username']}" if other["username"]
-               else f"<a href='tg://user?id={other['id']}'>{esc(other['name'])}</a>")
-    try:
-        await bot.send_photo(
-            to_user["id"], other["photo"],
-            caption=f"🎉 <b>MATCH!</b>\nSiz va {esc(other['name'])} bir-biringizni yoqtirdingiz.\n\n"
-                    f"💬 Yozing: {contact}")
-    except Exception:
-        pass
-
-
-async def handle_like(bot: Bot, me, tid):
-    uid = me["id"]
-    await set_reaction(uid, tid, 1)
-    target = await get_user(tid)
-    if not target:
-        return
-    prev = await pool.fetchval(
-        "SELECT value FROM reactions WHERE from_id=$1 AND to_id=$2", tid, uid)
-    if prev == 1:  # o'zaro layk -> MATCH
-        await pool.execute(
-            "INSERT INTO matches(a,b) VALUES(LEAST($1::bigint,$2::bigint),GREATEST($1::bigint,$2::bigint)) "
-            "ON CONFLICT DO NOTHING", uid, tid)
-        await notify_match(bot, me, target)
-        await notify_match(bot, target, me)
-    elif prev is None:  # birinchi layk -> "sizga shu odam layk bosdi"
+async def do_match(a, b):
+    for x, y in ((a, b), (b, a)):
+        u = await get_user(y)
+        link = f"@{u['username']}" if u["username"] else f'<a href="tg://user?id={y}">{esc(u["name"])}</a>'
         try:
             await bot.send_photo(
-                tid, me["photo"],
-                caption="❤️ <b>Sizga shu odam layk bosdi:</b>\n\n" + caption(me),
-                reply_markup=react_kb(uid, "n"))
+                x, u["photo"],
+                caption=f"🎉 <b>MATCH!</b>\n{esc(u['name'])} sizni ham yoqtirdi!\n\n💬 Yozing: {link}",
+            )
         except Exception:
             pass
-    # prev == 0 bo'lsa (u yoqtirmagan) hech narsa yuborilmaydi
 
 
-@router.callback_query(F.data.regexp(r"^(lk|ds|rp):\d+:[snl]$"))
-async def react(c: CallbackQuery, bot: Bot):
-    action, tid, src = c.data.split(":")
-    tid, uid = int(tid), c.from_user.id
+@r.callback_query(F.data.regexp(r"^(like|skip|save|rep|unsave):(\d+):([bls])$"))
+async def act(cb: CallbackQuery):
+    action, tid, src = cb.data.split(":")
+    tid = int(tid)
+    uid = cb.from_user.id
     me = await get_user(uid)
     if not me:
-        return await c.answer("Avval /start bosing", show_alert=True)
-    if action == "lk" and not await like_allowed(uid, me):
-        return await c.answer(
-            f"❌ Bugungi layk limiti ({DAILY_LIKES} ta) tugadi.\n👑 VIP bilan cheklovsiz!",
-            show_alert=True)
-    await c.answer()
-    try:
-        await c.message.delete()
-    except Exception:
-        pass
+        return await cb.answer("Avval /start bosing", show_alert=True)
+    now = int(time.time())
 
-    if action == "ds":
-        await set_reaction(uid, tid, 0)  # yoqmasa hech narsa yuborilmaydi
-    elif action == "rp":
-        await pool.execute("INSERT INTO reports(from_id,to_id) VALUES($1,$2)", uid, tid)
-        await set_reaction(uid, tid, 0)
-        for a in ADMIN_IDS:
+    if action == "like":
+        if not is_vip(me) and await likes_today(uid) >= FREE_LIKES:
+            return await cb.answer(f"Kunlik limit ({FREE_LIKES}) tugadi. VIP olib limitsiz foydalaning 💎", show_alert=True)
+        await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "like", now))
+        mutual = await q1("SELECT 1 FROM views WHERE from_id=? AND to_id=? AND action='like'", (tid, uid))
+        if mutual:
+            await do_match(uid, tid)
+        elif time.time() - notify_ts.get(tid, 0) > 6 * 3600:
+            notify_ts[tid] = time.time()
             try:
-                await bot.send_message(a, f"🚩 Yangi shikoyat. ID <code>{tid}</code> ustidan. /admin → Shikoyatlar")
+                await bot.send_message(tid, "💌 Kimdir sizga layk bosdi! «Menga kim layk bosdi» bo'limini oching.")
             except Exception:
                 pass
-        await bot.send_message(c.message.chat.id, "🚩 Shikoyat yuborildi, rahmat.")
-    else:
-        await handle_like(bot, me, tid)
+    elif action == "skip":
+        await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "skip", now))
+    elif action == "save":
+        await ex("INSERT OR IGNORE INTO saved VALUES(?,?)", (uid, tid))
+        await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "save", now))
+        await cb.answer("🔖 Saqlandi")
+    elif action == "unsave":
+        await ex("DELETE FROM saved WHERE user_id=? AND target_id=?", (uid, tid))
+        await cb.answer("O'chirildi")
+    elif action == "rep":
+        await ex("INSERT INTO reports(from_id,target_id,created) VALUES(?,?,?)", (uid, tid, now))
+        await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "skip", now))
+        await cb.answer("🚨 Shikoyat yuborildi")
+        for a in ADMINS:
+            try:
+                await bot.send_message(a, f"🚨 Yangi shikoyat: <code>{tid}</code> ustidan. /admin → Shikoyatlar")
+            except Exception:
+                pass
 
-    if src == "s":
-        await send_next(bot, c.message.chat.id, uid)
-    elif src == "l":
-        await show_liker(bot, c.message.chat.id, uid)
-
-
-@router.callback_query(F.data == "back")
-async def back(c: CallbackQuery):
-    await c.answer()
     try:
-        await c.message.delete()
+        await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await c.message.answer("Menyudan tanlang 👇", reply_markup=main_menu(c.from_user.id))
+    if action in ("like", "skip", "save", "rep") and src in ("b", "l"):
+        await cb.answer()
+        await show_next(uid, src)
+    elif action == "like":
+        await cb.answer("❤️")
 
 
-@router.callback_query(F.data == "chk")
-async def check_sub(c: CallbackQuery, bot: Bot):
-    if await subscribed(bot, c.from_user.id):
-        await c.answer("✅ Rahmat!")
-        try:
-            await c.message.delete()
-        except Exception:
-            pass
-        await c.message.answer("Menyudan tanlang 👇", reply_markup=main_menu(c.from_user.id))
-    else:
-        await c.answer("Hali obuna bo'lmadingiz ❌", show_alert=True)
+@r.callback_query(F.data == "back")
+async def back(cb: CallbackQuery):
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("Asosiy menyu", reply_markup=main_kb())
+    await cb.answer()
 
 
-# ====================== VIP ======================
-@router.message(F.text == "👑 VIP PREMIUM")
-async def vip(m: Message, bot: Bot):
-    me = await gate(bot, m.from_user.id, m.chat.id)
+@r.callback_query(F.data == "chk")
+async def chk(cb: CallbackQuery):
+    await cb.answer("✅ Rahmat!")
+    await cb.message.answer("Davom etish uchun /start bosing")
+
+
+# ---------- Kim layk bosdi ----------
+@r.message(F.text == B_LIKES, StateFilter(None))
+async def who_liked(m: Message):
+    uid = m.from_user.id
+    me = await get_user(uid)
     if not me:
-        return
-    status = (f"✅ Faol: {me['vip_until']:%d.%m.%Y} gacha" if is_vip(me) else "❌ Faol emas")
-    await m.answer(
-        "👑 <b>VIP PREMIUM</b>\n\n"
-        "✅ Cheklovsiz layk\n"
-        "✅ Anketangiz qidiruvda birinchi ko'rsatiladi\n"
-        "✅ Ismingiz yonida 👑 belgisi\n\n"
-        f"Bepul rejada kuniga {DAILY_LIKES} ta layk.\n"
-        f"Holat: {status}\n\n"
-        f"VIP olish uchun {esc(VIP_CONTACT)} ga yozing va ID raqamingizni yuboring:\n"
-        f"<code>{m.from_user.id}</code>")
+        return await m.answer("Avval /start bosing.")
+    row = await q1(
+        """SELECT COUNT(*) c FROM views v WHERE v.to_id=? AND v.action='like'
+           AND v.from_id NOT IN (SELECT to_id FROM views WHERE from_id=?)""", (uid, uid))
+    if row["c"] == 0:
+        return await m.answer("Hozircha yangi laykler yo'q. Anketangiz qidiruvda ko'rsatilmoqda 😉")
+    if is_vip(me) or uid in ADMINS:
+        await m.answer(f"💘 Sizga {row['c']} kishi layk bosgan:")
+        return await show_next(uid, "l")
+    await m.answer(f"💘 Sizga <b>{row['c']}</b> kishi layk bosdi!\n\nKimligini ko'rish uchun 💎 VIP PREMIUM oling.",
+                   reply_markup=ik([[("💎 VIP olish", "vipinfo")]]))
 
 
-# ====================== ADMIN PANEL ======================
-class Bc(StatesGroup):
-    content = State()
-    confirm = State()
+@r.callback_query(F.data == "vipinfo")
+async def vipinfo_cb(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(await get_setting("vip_text", DEFAULT_VIP_TEXT))
 
 
-class AdmUser(StatesGroup):
-    query = State()
+# ---------- Saqlanganlar ----------
+@r.message(F.text == B_SAVED, StateFilter(None))
+async def saved(m: Message):
+    rows = await qa("SELECT u.* FROM saved s JOIN users u ON u.id=s.target_id WHERE s.user_id=? AND u.banned=0 LIMIT 10",
+                    (m.from_user.id,))
+    if not rows:
+        return await m.answer("🔖 Saqlangan anketalar yo'q.")
+    for u in rows:
+        await m.answer_photo(u["photo"], caption=profile_text(u), reply_markup=card_kb(u["id"], "s"))
 
 
-def admin_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="adm:stats"),
-         InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="adm:bc")],
-        [InlineKeyboardButton(text="🔎 Foydalanuvchi", callback_data="adm:user"),
-         InlineKeyboardButton(text="🚩 Shikoyatlar", callback_data="adm:rep")],
-        [InlineKeyboardButton(text="📥 CSV eksport", callback_data="adm:csv")],
-    ])
-
-
-@admin.message(Command("admin"))
-@admin.message(F.text == "🛠 Admin panel")
-async def admin_panel(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
-
-
-# ---- statistika
-@admin.callback_query(F.data == "adm:stats")
-async def adm_stats(c: CallbackQuery):
-    await c.answer()
-    s = await pool.fetchrow("""
-        SELECT count(*) total,
-          count(*) FILTER (WHERE gender='Yigit') boys,
-          count(*) FILTER (WHERE gender='Qiz') girls,
-          count(*) FILTER (WHERE created_at >= date_trunc('day', now())) today,
-          count(*) FILTER (WHERE last_seen >= now() - interval '24 hours') active24,
-          count(*) FILTER (WHERE vip_until > now()) vip,
-          count(*) FILTER (WHERE is_banned) banned,
-          count(*) FILTER (WHERE NOT is_active) hidden
-        FROM users""")
-    r = await pool.fetchrow("""
-        SELECT count(*) FILTER (WHERE value=1) likes,
-               count(*) FILTER (WHERE value=0) dislikes FROM reactions""")
-    matches = await pool.fetchval("SELECT count(*) FROM matches")
-    reports = await pool.fetchval("SELECT count(*) FROM reports WHERE NOT handled")
-    cities = await pool.fetch(
-        "SELECT initcap(lower(city)) c, count(*) n FROM users GROUP BY 1 ORDER BY n DESC LIMIT 5")
-    top = "\n".join(f"  • {esc(x['c'])}: {x['n']}" for x in cities) or "  —"
-    await c.message.answer(
-        "📊 <b>Statistika</b>\n\n"
-        f"👥 Jami: <b>{s['total']}</b>\n"
-        f"👨 Yigitlar: {s['boys']}   👩 Qizlar: {s['girls']}\n"
-        f"🆕 Bugun qo'shilgan: {s['today']}\n"
-        f"🟢 So'nggi 24 soatda faol: {s['active24']}\n"
-        f"👑 VIP: {s['vip']}\n"
-        f"🚫 Bloklangan: {s['banned']}   🙈 Yashirin: {s['hidden']}\n\n"
-        f"❤️ Laykler: {r['likes']}   👎 Dislaykler: {r['dislikes']}\n"
-        f"🎉 Matchlar: {matches}\n"
-        f"🚩 Ko'rilmagan shikoyatlar: {reports}\n\n"
-        f"🏙 Top shaharlar:\n{top}")
-
-
-# ---- xabar yuborish (rassilka)
-@admin.callback_query(F.data == "adm:bc")
-async def adm_bc(c: CallbackQuery):
-    await c.answer()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Hammaga", callback_data="bc:t:all")],
-        [InlineKeyboardButton(text="👩 Qizlarga", callback_data="bc:t:Qiz"),
-         InlineKeyboardButton(text="👨 Yigitlarga", callback_data="bc:t:Yigit")],
-    ])
-    await c.message.answer("Kimga yuboramiz?", reply_markup=kb)
-
-
-@admin.callback_query(F.data.startswith("bc:t:"))
-async def bc_target(c: CallbackQuery, state: FSMContext):
-    await c.answer()
-    await state.update_data(target=c.data.split(":")[2])
-    await state.set_state(Bc.content)
-    await c.message.answer("Yuboriladigan xabarni jo'nating (matn, rasm yoki video):")
-
-
-@admin.message(Bc.content)
-async def bc_content(m: Message, state: FSMContext, bot: Bot):
-    await state.update_data(chat_id=m.chat.id, msg_id=m.message_id)
-    await state.set_state(Bc.confirm)
-    await m.answer("👆 Shu xabar yuboriladi. Tasdiqlaysizmi?", reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Yuborish", callback_data="bc:go"),
-            InlineKeyboardButton(text="❌ Bekor", callback_data="bc:no"),
-        ]]))
-
-
-@admin.callback_query(Bc.confirm, F.data == "bc:no")
-async def bc_no(c: CallbackQuery, state: FSMContext):
-    await c.answer("Bekor qilindi")
-    await state.clear()
-
-
-@admin.callback_query(Bc.confirm, F.data == "bc:go")
-async def bc_go(c: CallbackQuery, state: FSMContext, bot: Bot):
-    d = await state.get_data()
-    await state.clear()
-    await c.answer("Yuborish boshlandi")
-    await c.message.answer("📤 Yuborilmoqda... tugagach xabar beraman.")
-    asyncio.create_task(run_broadcast(bot, c.from_user.id, d["target"], d["chat_id"], d["msg_id"]))
-
-
-async def run_broadcast(bot: Bot, admin_id, target, chat_id, msg_id):
-    if target == "all":
-        rows = await pool.fetch("SELECT id FROM users WHERE NOT is_banned")
-    else:
-        rows = await pool.fetch("SELECT id FROM users WHERE NOT is_banned AND gender=$1", target)
-    ok = fail = 0
-    for r in rows:
-        for _ in range(2):
-            try:
-                await bot.copy_message(r["id"], chat_id, msg_id)
-                ok += 1
-                break
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-            except Exception:
-                fail += 1
-                break
-        await asyncio.sleep(0.05)
-    await bot.send_message(admin_id, f"✅ Xabar yuborildi.\nYetkazildi: {ok}\nYetmadi: {fail}")
-
-
-# ---- foydalanuvchi qidirish va boshqarish
-def user_kb(u):
-    uid = u["id"]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="✅ Blokdan chiqarish" if u["is_banned"] else "🚫 Bloklash",
-            callback_data=f"au:{'unban' if u['is_banned'] else 'ban'}:{uid}")],
-        [InlineKeyboardButton(text="👑 +30 kun VIP", callback_data=f"au:vip30:{uid}"),
-         InlineKeyboardButton(text="👑 +90 kun", callback_data=f"au:vip90:{uid}")],
-        [InlineKeyboardButton(text="❎ VIP ni olish", callback_data=f"au:vipoff:{uid}"),
-         InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"au:del:{uid}")],
-    ])
-
-
-def admin_card(u):
-    vip = f"✅ {u['vip_until']:%d.%m.%Y} gacha" if is_vip(u) else "❌"
-    return (
-        f"🆔 <code>{u['id']}</code>  @{esc(u['username'] or '—')}\n\n"
-        f"{caption(u)}\n\n"
-        f"👑 VIP: {vip}\n"
-        f"🚫 Bloklangan: {'ha' if u['is_banned'] else 'yoq'}\n"
-        f"👁 Ko'rinadi: {'ha' if u['is_active'] else 'yoq'}\n"
-        f"📅 Qo'shilgan: {u['created_at']:%d.%m.%Y}")
-
-
-@admin.callback_query(F.data == "adm:user")
-async def adm_user(c: CallbackQuery, state: FSMContext):
-    await c.answer()
-    await state.set_state(AdmUser.query)
-    await c.message.answer("Foydalanuvchi ID raqami yoki @username ini yozing:")
-
-
-@admin.message(AdmUser.query, F.text)
-async def adm_user_find(m: Message, state: FSMContext):
-    q = m.text.strip().lstrip("@")
-    if q.isdigit():
-        u = await get_user(int(q))
-    else:
-        u = await pool.fetchrow("SELECT * FROM users WHERE lower(username)=lower($1)", q)
-    await state.clear()
+# ---------- Profil ----------
+@r.message(F.text == B_PROFILE, StateFilter(None))
+async def my_profile(m: Message):
+    u = await get_user(m.from_user.id)
     if not u:
-        return await m.answer("❌ Topilmadi.")
-    await m.answer_photo(u["photo"], caption=admin_card(u), reply_markup=user_kb(u))
+        return await m.answer("Avval /start bosing.")
+    vip = f"\n\n💎 VIP: {time.strftime('%d.%m.%Y', time.localtime(u['vip_until']))} gacha" if is_vip(u) else ""
+    state = "🟢 Anketa faol" if u["active"] else "🔴 Anketa yashirilgan"
+    kb = ik([
+        [("✏️ Qayta to'ldirish", "p_edit")],
+        [("🙈 Yashirish" if u["active"] else "👁 Faollashtirish", "p_toggle")],
+        [("🗑 O'chirish", "p_del")],
+    ])
+    await m.answer_photo(u["photo"], caption=f"{profile_text(u)}\n\n{state}{vip}", reply_markup=kb)
 
 
-@admin.callback_query(F.data.regexp(r"^au:(ban|unban|vip30|vip90|vipoff|del):\d+$"))
-async def adm_user_action(c: CallbackQuery, bot: Bot):
-    _, act, uid = c.data.split(":")
-    uid = int(uid)
-    if act == "ban":
-        await pool.execute("UPDATE users SET is_banned=TRUE WHERE id=$1", uid)
-    elif act == "unban":
-        await pool.execute("UPDATE users SET is_banned=FALSE WHERE id=$1", uid)
-    elif act in ("vip30", "vip90"):
-        days = 30 if act == "vip30" else 90
-        await pool.execute(
-            "UPDATE users SET vip_until=GREATEST(COALESCE(vip_until, now()), now()) + $2 * interval '1 day' "
-            "WHERE id=$1", uid, days)
+@r.callback_query(F.data == "p_edit")
+async def p_edit(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await begin_reg(cb.message, state, cb.from_user.first_name or "Ism")
+
+
+@r.callback_query(F.data == "p_toggle")
+async def p_toggle(cb: CallbackQuery):
+    await ex("UPDATE users SET active=1-active WHERE id=?", (cb.from_user.id,))
+    await cb.answer("Bajarildi")
+    await cb.message.answer("Holat o'zgartirildi. «Mening profilim» orqali ko'ring.")
+
+
+@r.callback_query(F.data == "p_del")
+async def p_del(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("Anketani butunlay o'chirasizmi?", reply_markup=ik([[("Ha, o'chirish", "p_del_yes"), ("Yo'q", "back")]]))
+
+
+@r.callback_query(F.data == "p_del_yes")
+async def p_del_yes(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await ex("DELETE FROM users WHERE id=?", (uid,))
+    await ex("DELETE FROM views WHERE from_id=? OR to_id=?", (uid, uid))
+    await ex("DELETE FROM saved WHERE user_id=? OR target_id=?", (uid, uid))
+    await cb.answer()
+    await cb.message.answer("🗑 Anketa o'chirildi. Qayta boshlash: /start", reply_markup=ReplyKeyboardRemove())
+
+
+# ---------- VIP ----------
+@r.message(F.text == B_VIP, StateFilter(None))
+async def vip(m: Message):
+    u = await get_user(m.from_user.id)
+    txt = await get_setting("vip_text", DEFAULT_VIP_TEXT)
+    if is_vip(u):
+        txt = f"✅ Sizda VIP faol: {time.strftime('%d.%m.%Y', time.localtime(u['vip_until']))} gacha\n\n" + txt
+    await m.answer(txt)
+
+
+# ---------- Anonim suhbat ----------
+class InChat(Filter):
+    async def __call__(self, m: Message) -> bool:
+        return m.from_user.id in pairs
+
+
+chat_r = Router()
+chat_r.message.filter(InChat())
+
+
+def chat_kb():
+    return rk([[B_NEXT], [B_STOP]])
+
+
+async def end_chat(uid, notify_self=True):
+    partner = pairs.pop(uid, None)
+    if partner:
+        pairs.pop(partner, None)
         try:
-            await bot.send_message(uid, f"👑 Tabriklaymiz! Sizga {days} kunlik VIP berildi.")
+            await bot.send_message(partner, "😔 Suhbatdosh suhbatni tugatdi.", reply_markup=main_kb())
         except Exception:
             pass
-    elif act == "vipoff":
-        await pool.execute("UPDATE users SET vip_until=NULL WHERE id=$1", uid)
-    elif act == "del":
-        await delete_user_data(uid)
-        await c.answer("O'chirildi")
-        return await c.message.edit_caption(caption="🗑 Foydalanuvchi o'chirildi.")
-    await c.answer("Bajarildi ✅")
-    u = await get_user(uid)
-    if u:
-        await c.message.edit_caption(caption=admin_card(u), reply_markup=user_kb(u))
+    if notify_self:
+        await bot.send_message(uid, "Suhbat tugadi.", reply_markup=main_kb())
 
 
-# ---- shikoyatlar
-async def show_report(bot: Bot, chat_id):
-    r = await pool.fetchrow("SELECT * FROM reports WHERE NOT handled ORDER BY id LIMIT 1")
-    if not r:
-        return await bot.send_message(chat_id, "✅ Yangi shikoyatlar yo'q.")
-    u = await get_user(r["to_id"])
-    if not u:
-        await pool.execute("UPDATE reports SET handled=TRUE WHERE to_id=$1", r["to_id"])
-        return await show_report(bot, chat_id)
-    cnt = await pool.fetchval("SELECT count(*) FROM reports WHERE to_id=$1", u["id"])
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚫 Bloklash", callback_data=f"ar:ban:{u['id']}"),
-        InlineKeyboardButton(text="✅ Rad etish", callback_data=f"ar:ok:{u['id']}"),
-    ]])
-    await bot.send_photo(
-        chat_id, u["photo"],
-        caption=f"🚩 <b>Shikoyat</b> (shu odamga jami {cnt} ta)\n"
-                f"Shikoyatchi: <code>{r['from_id']}</code>\n\n" + admin_card(u),
-        reply_markup=kb)
+async def start_chat(uid):
+    if uid in waiting:
+        waiting.remove(uid)
+    while waiting:
+        pid = waiting.pop(0)
+        if pid != uid and pid not in pairs:
+            pairs[uid], pairs[pid] = pid, uid
+            txt = "✅ Suhbatdosh topildi! Yozishingiz mumkin (matn, rasm, ovoz).\n/stop — tugatish"
+            await bot.send_message(uid, txt, reply_markup=chat_kb())
+            await bot.send_message(pid, txt, reply_markup=chat_kb())
+            return
+    waiting.append(uid)
+    await bot.send_message(uid, "🔎 Suhbatdosh qidirilmoqda...", reply_markup=rk([[B_CANCEL]]))
 
 
-@admin.callback_query(F.data == "adm:rep")
-async def adm_rep(c: CallbackQuery, bot: Bot):
-    await c.answer()
-    await show_report(bot, c.message.chat.id)
-
-
-@admin.callback_query(F.data.regexp(r"^ar:(ban|ok):\d+$"))
-async def adm_rep_action(c: CallbackQuery, bot: Bot):
-    _, act, uid = c.data.split(":")
-    uid = int(uid)
-    if act == "ban":
-        await pool.execute("UPDATE users SET is_banned=TRUE WHERE id=$1", uid)
-    await pool.execute("UPDATE reports SET handled=TRUE WHERE to_id=$1", uid)
-    await c.answer("Bajarildi ✅")
+@chat_r.message()
+async def relay(m: Message):
+    uid = m.from_user.id
+    if m.text in (B_STOP, "/stop"):
+        return await end_chat(uid)
+    if m.text == B_NEXT:
+        await end_chat(uid, notify_self=False)
+        return await start_chat(uid)
     try:
-        await c.message.delete()
+        await m.copy_to(pairs[uid])
+    except Exception:
+        await m.answer("⚠️ Xabarni yuborib bo'lmadi.")
+
+
+@r.message(F.text == B_CHAT, StateFilter(None))
+async def chat_btn(m: Message):
+    if not await get_user(m.from_user.id):
+        return await m.answer("Avval /start bosing.")
+    await start_chat(m.from_user.id)
+
+
+@r.message(F.text == B_CANCEL, StateFilter(None))
+async def cancel_wait(m: Message):
+    if m.from_user.id in waiting:
+        waiting.remove(m.from_user.id)
+    await m.answer("Bekor qilindi.", reply_markup=main_kb())
+
+
+# ---------- ADMIN PANEL ----------
+class Adm(StatesGroup):
+    bc = State()
+    ban = State()
+    unban = State()
+    vip = State()
+    chan = State()
+    find = State()
+    viptext = State()
+
+
+adm = Router()
+adm.message.filter(F.from_user.id.in_(ADMINS))
+adm.callback_query.filter(F.from_user.id.in_(ADMINS))
+
+ADMIN_KB = ik([
+    [("📊 Statistika", "a:stats"), ("📢 Xabar yuborish", "a:bc")],
+    [("🚫 Ban", "a:ban"), ("✅ Unban", "a:unban")],
+    [("💎 VIP berish", "a:vip"), ("🔎 Foydalanuvchi", "a:find")],
+    [("🚨 Shikoyatlar", "a:reports"), ("📌 Majburiy kanal", "a:chan")],
+    [("✏️ VIP matni", "a:viptext")],
+])
+
+
+@adm.message(Command("admin"))
+async def admin_cmd(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("🛠 <b>Admin panel</b>", reply_markup=ADMIN_KB)
+
+
+@adm.callback_query(F.data == "a:stats")
+async def a_stats(cb: CallbackQuery):
+    now = int(time.time())
+    day = now - now % 86400
+    c = lambda s, a=(): q1(s, a)
+    total = (await c("SELECT COUNT(*) c FROM users"))["c"]
+    active = (await c("SELECT COUNT(*) c FROM users WHERE active=1 AND banned=0"))["c"]
+    male = (await c("SELECT COUNT(*) c FROM users WHERE gender='male'"))["c"]
+    female = (await c("SELECT COUNT(*) c FROM users WHERE gender='female'"))["c"]
+    today = (await c("SELECT COUNT(*) c FROM users WHERE created>=?", (day,)))["c"]
+    vips = (await c("SELECT COUNT(*) c FROM users WHERE vip_until>?", (now,)))["c"]
+    banned = (await c("SELECT COUNT(*) c FROM users WHERE banned=1"))["c"]
+    likes = (await c("SELECT COUNT(*) c FROM views WHERE action='like'"))["c"]
+    matches = (await c(
+        """SELECT COUNT(*) c FROM views a JOIN views b ON a.from_id=b.to_id AND a.to_id=b.from_id
+           WHERE a.action='like' AND b.action='like' AND a.from_id<a.to_id"""))["c"]
+    await cb.message.answer(
+        f"📊 <b>Statistika</b>\n\n👥 Jami: {total}\n🟢 Faol: {active}\n👨 Yigit: {male} | 👩 Qiz: {female}\n"
+        f"🆕 Bugun qo'shilgan: {today}\n💎 VIP: {vips}\n🚫 Banlangan: {banned}\n"
+        f"❤️ Laykler: {likes}\n🎉 Matchlar: {matches}\n💬 Suhbatda: {len(pairs)//2} juft | Kutmoqda: {len(waiting)}"
+    )
+    await cb.answer()
+
+
+PROMPTS = {
+    "bc": ("📢 Yuboriladigan xabarni jo'nating (matn/rasm/video):", Adm.bc),
+    "ban": ("🚫 Ban qilinadigan user ID:", Adm.ban),
+    "unban": ("✅ Unban qilinadigan user ID:", Adm.unban),
+    "vip": ("💎 Format: <code>ID KUN</code> (masalan: <code>123456 30</code>). Olib tashlash uchun KUN=0", Adm.vip),
+    "find": ("🔎 User ID yuboring:", Adm.find),
+    "chan": ("📌 Kanal username yuboring (masalan <code>@kanal</code>) yoki <code>off</code>. Bot kanalda admin bo'lishi shart.", Adm.chan),
+    "viptext": ("✏️ VIP bo'limi uchun yangi matnni yuboring (HTML mumkin):", Adm.viptext),
+}
+
+
+@adm.callback_query(F.data.regexp(r"^a:(bc|ban|unban|vip|find|chan|viptext)$"))
+async def a_prompt(cb: CallbackQuery, state: FSMContext):
+    key = cb.data.split(":")[1]
+    txt, st = PROMPTS[key]
+    await state.set_state(st)
+    await cb.message.answer(txt + "\n\nBekor qilish: /admin")
+    await cb.answer()
+
+
+@adm.message(Adm.bc)
+async def s_bc(m: Message, state: FSMContext):
+    await state.clear()
+    ids = [x["id"] for x in await qa("SELECT id FROM users WHERE banned=0")]
+    await m.answer(f"📤 {len(ids)} ta foydalanuvchiga yuborilmoqda...")
+    ok = fail = 0
+    for i in ids:
+        try:
+            await m.copy_to(i)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await m.answer(f"✅ Yuborildi: {ok}\n❌ Xato: {fail}")
+
+
+async def parse_id(m: Message):
+    if not (m.text or "").strip().isdigit():
+        await m.answer("ID raqam bo'lishi kerak.")
+        return None
+    return int(m.text.strip())
+
+
+@adm.message(Adm.ban)
+async def s_ban(m: Message, state: FSMContext):
+    uid = await parse_id(m)
+    if uid is None:
+        return
+    await state.clear()
+    await ex("UPDATE users SET banned=1 WHERE id=?", (uid,))
+    await end_chat(uid, notify_self=False)
+    if uid in waiting:
+        waiting.remove(uid)
+    await m.answer(f"🚫 {uid} banlandi.")
+
+
+@adm.message(Adm.unban)
+async def s_unban(m: Message, state: FSMContext):
+    uid = await parse_id(m)
+    if uid is None:
+        return
+    await state.clear()
+    await ex("UPDATE users SET banned=0 WHERE id=?", (uid,))
+    await m.answer(f"✅ {uid} unban qilindi.")
+
+
+@adm.message(Adm.vip)
+async def s_vip(m: Message, state: FSMContext):
+    parts = (m.text or "").split()
+    if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
+        return await m.answer("Format: ID KUN")
+    uid, days = int(parts[0]), int(parts[1])
+    u = await get_user(uid)
+    if not u:
+        return await m.answer("Bunday foydalanuvchi yo'q.")
+    await state.clear()
+    if days <= 0:
+        await ex("UPDATE users SET vip_until=0 WHERE id=?", (uid,))
+        return await m.answer("VIP olib tashlandi.")
+    base = max(u["vip_until"], int(time.time()))
+    until = base + days * 86400
+    await ex("UPDATE users SET vip_until=? WHERE id=?", (until, uid))
+    await m.answer(f"💎 {uid} ga {days} kunlik VIP berildi.")
+    try:
+        await bot.send_message(uid, f"🎉 Sizga {days} kunlik 💎 VIP berildi!")
     except Exception:
         pass
-    await show_report(bot, c.message.chat.id)
 
 
-# ---- CSV eksport
-@admin.callback_query(F.data == "adm:csv")
-async def adm_csv(c: CallbackQuery):
-    await c.answer()
-    rows = await pool.fetch("SELECT * FROM users ORDER BY created_at")
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["id", "username", "name", "gender", "age", "city", "interests",
-                "vip_until", "banned", "active", "created_at"])
-    for u in rows:
-        w.writerow([u["id"], u["username"], u["name"], u["gender"], u["age"], u["city"],
-                    u["interests"], u["vip_until"], u["is_banned"], u["is_active"], u["created_at"]])
-    data = buf.getvalue().encode("utf-8-sig")
-    await c.message.answer_document(
-        BufferedInputFile(data, filename=f"users_{datetime.now():%Y%m%d}.csv"),
-        caption=f"👥 Jami: {len(rows)}")
-
-
-# ====================== ISHGA TUSHIRISH ======================
-async def health(request):
-    return web.Response(text="AdMatch Bot ishlayapti")
-
-
-async def keep_alive():
-    """Render bepul rejada uxlab qolmasligi uchun o'zini ping qiladi."""
-    url = os.getenv("RENDER_EXTERNAL_URL")
-    if not url:
+@adm.message(Adm.find)
+async def s_find(m: Message, state: FSMContext):
+    uid = await parse_id(m)
+    if uid is None:
         return
-    async with ClientSession() as s:
-        while True:
-            await asyncio.sleep(600)
-            try:
-                await s.get(url)
-            except Exception:
-                pass
+    await state.clear()
+    u = await get_user(uid)
+    if not u:
+        return await m.answer("Topilmadi.")
+    info = (f"ID: <code>{uid}</code>\nUsername: @{u['username']}\nBan: {bool(u['banned'])}\n"
+            f"VIP: {is_vip(u)}\nFaol: {bool(u['active'])}")
+    await m.answer_photo(u["photo"], caption=profile_text(u) + "\n\n" + info,
+                         reply_markup=ik([[("🚫 Ban", f"ab:{uid}"), ("✅ Unban", f"au:{uid}")]]))
 
 
+@adm.callback_query(F.data.regexp(r"^(ab|au):(\d+)$"))
+async def a_quick_ban(cb: CallbackQuery):
+    act_, uid = cb.data.split(":")
+    await ex("UPDATE users SET banned=? WHERE id=?", (1 if act_ == "ab" else 0, int(uid)))
+    await cb.answer("Bajarildi", show_alert=True)
+
+
+@adm.message(Adm.chan)
+async def s_chan(m: Message, state: FSMContext):
+    v = (m.text or "").strip()
+    await state.clear()
+    if v.lower() == "off":
+        await set_setting("channel", "")
+        return await m.answer("📌 Majburiy obuna o'chirildi.")
+    if not v.startswith("@"):
+        v = "@" + v
+    await set_setting("channel", v)
+    await m.answer(f"📌 Majburiy kanal: {v}\nBot shu kanalda admin ekanini tekshiring!")
+
+
+@adm.message(Adm.viptext)
+async def s_viptext(m: Message, state: FSMContext):
+    await state.clear()
+    await set_setting("vip_text", m.html_text)
+    await m.answer("✅ VIP matni yangilandi.")
+
+
+@adm.callback_query(F.data == "a:reports")
+async def a_reports(cb: CallbackQuery):
+    rows = await qa("SELECT * FROM reports WHERE handled=0 ORDER BY id DESC LIMIT 5")
+    if not rows:
+        await cb.message.answer("🚨 Yangi shikoyatlar yo'q.")
+    for rp in rows:
+        u = await get_user(rp["target_id"])
+        txt = f"🚨 Shikoyat #{rp['id']}\nShikoyatchi: <code>{rp['from_id']}</code>\nAyblanuvchi: <code>{rp['target_id']}</code>"
+        kb = ik([[("🚫 Ban", f"rb:{rp['id']}:{rp['target_id']}"), ("✅ Yopish", f"rk:{rp['id']}:0")]])
+        if u and u["photo"]:
+            await cb.message.answer_photo(u["photo"], caption=profile_text(u) + "\n\n" + txt, reply_markup=kb)
+        else:
+            await cb.message.answer(txt, reply_markup=kb)
+    await cb.answer()
+
+
+@adm.callback_query(F.data.regexp(r"^(rb|rk):(\d+):(\d+)$"))
+async def a_report_act(cb: CallbackQuery):
+    act_, rid, tid = cb.data.split(":")
+    await ex("UPDATE reports SET handled=1 WHERE id=?", (int(rid),))
+    if act_ == "rb":
+        await ex("UPDATE users SET banned=1 WHERE id=?", (int(tid),))
+    await cb.answer("Bajarildi", show_alert=True)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+@adm.callback_query(F.data == "a:chan_dummy")
+async def _dummy(cb: CallbackQuery):
+    await cb.answer()
+
+
+# ---------- Ishga tushirish ----------
 async def main():
-    global pool
-    logging.basicConfig(level=logging.INFO)
-    if not TOKEN or not DATABASE_URL:
-        raise SystemExit("BOT_TOKEN va DATABASE_URL o'rnatilmagan!")
-
-    ssl = "require" if "render.com" in DATABASE_URL else None
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, ssl=ssl)
-    await pool.execute(SCHEMA)
-
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    if not TOKEN:
+        raise SystemExit("BOT_TOKEN topilmadi (.env faylini tekshiring)")
+    await init_db()
     dp = Dispatcher(storage=MemoryStorage())
-    guard = Guard()
-    dp.message.outer_middleware(guard)
-    dp.callback_query.outer_middleware(guard)
-    dp.include_router(admin)   # admin birinchi
-    dp.include_router(router)
-
-    # Render Web Service port talab qiladi
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    asyncio.create_task(keep_alive())
-
-    await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
+    dp.message.outer_middleware(Guard())
+    dp.callback_query.outer_middleware(Guard())
+    dp.include_router(chat_r)
+    dp.include_router(adm)
+    dp.include_router(r)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
