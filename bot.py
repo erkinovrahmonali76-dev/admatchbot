@@ -49,10 +49,21 @@ B_SKIP = "⏭ O'tkazib yuborish"
 DEFAULT_VIP_TEXT = (
     "💎 <b>VIP PREMIUM</b>\n\n"
     "✅ Sizga kim layk bosganini ko'rasiz\n"
+    "✅ Shaxsiy chatga (Telegram profilga) o'tish imkoniyati\n"
     "✅ Anketangiz qidiruvda birinchi ko'rsatiladi\n"
-    "✅ Kunlik layk limiti yo'q\n\n"
-    "Sotib olish uchun admin bilan bog'laning."
+    "✅ Kunlik layk limiti yo'q"
 )
+
+# reja: (kun, promokod bonus kuni, nomi)
+PLANS = {
+    "w": (7, 3, "1 haftalik"),
+    "m": (30, 4, "1 oylik"),
+    "q": (90, 5, "3 oylik"),
+}
+DEFAULT_PRICES = {"w": 15000, "m": 40000, "q": 100000}
+DEFAULT_CARD = "6262 5701 3419 2691"
+DEFAULT_HOLDER = "Boratova Zarnigir"
+DEFAULT_RECYCLE_DAYS = 3
 
 pairs: dict[int, int] = {}
 waiting: list[int] = []
@@ -61,6 +72,14 @@ notify_ts: dict[int, float] = {}
 
 def esc(s) -> str:
     return html.escape(str(s or ""))
+
+
+def money(n) -> str:
+    return f"{int(n):,}".replace(",", " ")
+
+
+def fmt_date(ts) -> str:
+    return time.strftime("%d.%m.%Y", time.localtime(ts))
 
 
 # ---------- DB ----------
@@ -83,6 +102,12 @@ async def ex(sql, args=()):
     await db.commit()
 
 
+async def ex_cur(sql, args=()):
+    cur = await db.execute(sql, args)
+    await db.commit()
+    return cur
+
+
 async def init_db():
     global db
     db = await aiosqlite.connect(DB_PATH)
@@ -93,7 +118,7 @@ async def init_db():
             id INTEGER PRIMARY KEY, username TEXT, name TEXT, age INTEGER,
             gender TEXT, looking TEXT DEFAULT 'all', city TEXT, interests TEXT,
             bio TEXT, photo TEXT, active INTEGER DEFAULT 1, banned INTEGER DEFAULT 0,
-            vip_until INTEGER DEFAULT 0, created INTEGER);
+            vip_until INTEGER DEFAULT 0, created INTEGER, promo TEXT);
         CREATE TABLE IF NOT EXISTS views(
             from_id INTEGER, to_id INTEGER, action TEXT, created INTEGER,
             PRIMARY KEY(from_id, to_id));
@@ -103,8 +128,22 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, target_id INTEGER,
             created INTEGER, handled INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan TEXT,
+            days INTEGER, bonus INTEGER DEFAULT 0, amount INTEGER, promo TEXT,
+            file_id TEXT, status INTEGER DEFAULT 0, created INTEGER, handled_by INTEGER);
+        CREATE TABLE IF NOT EXISTS promos(
+            code TEXT PRIMARY KEY, max_uses INTEGER DEFAULT 0, used INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS promo_uses(
+            user_id INTEGER, code TEXT, PRIMARY KEY(user_id, code));
         """
     )
+    # eski bazalar uchun
+    try:
+        await db.execute("ALTER TABLE users ADD COLUMN promo TEXT")
+    except Exception:
+        pass
     await db.commit()
 
 
@@ -121,12 +160,40 @@ async def set_setting(key, value):
     )
 
 
+async def int_setting(key, default) -> int:
+    v = await get_setting(key)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+async def price_of(plan) -> int:
+    return await int_setting(f"price_{plan}", DEFAULT_PRICES[plan])
+
+
+async def get_card():
+    return (await get_setting("card", DEFAULT_CARD), await get_setting("holder", DEFAULT_HOLDER))
+
+
 async def get_user(uid):
     return await q1("SELECT * FROM users WHERE id=?", (uid,))
 
 
 def is_vip(u) -> bool:
     return bool(u) and u["vip_until"] > time.time()
+
+
+def has_premium(uid, u) -> bool:
+    return uid in ADMINS or is_vip(u)
+
+
+async def grant_vip(uid, days) -> int:
+    u = await get_user(uid)
+    base = max(u["vip_until"] if u else 0, int(time.time()))
+    until = base + days * 86400
+    await ex("UPDATE users SET vip_until=? WHERE id=?", (until, uid))
+    return until
 
 
 def profile_text(u) -> str:
@@ -138,6 +205,12 @@ def profile_text(u) -> str:
     if u["bio"]:
         t += f"\n\n{esc(u['bio'])}"
     return t
+
+
+def user_link(u) -> str:
+    if u["username"]:
+        return f"@{u['username']}"
+    return f'<a href="tg://user?id={u["id"]}">{esc(u["name"])}</a>'
 
 
 # ---------- Klaviaturalar ----------
@@ -160,9 +233,11 @@ def ik(rows):
 
 
 def card_kb(tid, src):
+    dm = [("💬 Shaxsiy chat 💎", f"dm:{tid}")]
     if src == "s":
-        return ik([[("❤️", f"like:{tid}:s"), ("🗑 O'chirish", f"unsave:{tid}:s")]])
+        return ik([[("❤️", f"like:{tid}:s"), ("🗑 O'chirish", f"unsave:{tid}:s")], dm])
     rows = [[("❤️", f"like:{tid}:{src}"), ("👎", f"skip:{tid}:{src}")]]
+    rows.append(dm)
     rows.append([("🔖 Saqlash", f"save:{tid}:{src}"), ("🚨 Shikoyat", f"rep:{tid}:{src}")])
     rows.append([("⬅️ Orqaga", "back")])
     return ik(rows)
@@ -210,6 +285,11 @@ class Reg(StatesGroup):
     interests = State()
     bio = State()
     photo = State()
+
+
+class Pay(StatesGroup):
+    receipt = State()
+    promo = State()
 
 
 r = Router()
@@ -317,11 +397,15 @@ async def reg_photo_bad(m: Message):
 
 # ---------- Qidirish ----------
 async def next_candidate(me):
+    """Ko'rilgan anketalar N kundan keyin qayta chiqadi (layk bosilganlar ham)."""
+    days = await int_setting("recycle_days", DEFAULT_RECYCLE_DAYS)
+    now = int(time.time())
+    cutoff = now - days * 86400
     sql = """SELECT * FROM users WHERE id!=? AND active=1 AND banned=0 AND photo IS NOT NULL
              AND (?='all' OR gender=?) AND (looking='all' OR looking=?)
-             AND id NOT IN (SELECT to_id FROM views WHERE from_id=?)
+             AND id NOT IN (SELECT to_id FROM views WHERE from_id=? AND created>?)
              ORDER BY (vip_until>?) DESC, RANDOM() LIMIT 1"""
-    return await q1(sql, (me["id"], me["looking"], me["looking"], me["gender"], me["id"], int(time.time())))
+    return await q1(sql, (me["id"], me["looking"], me["looking"], me["gender"], me["id"], cutoff, now))
 
 
 async def next_liker(uid):
@@ -356,13 +440,23 @@ async def likes_today(uid) -> int:
 
 async def do_match(a, b):
     for x, y in ((a, b), (b, a)):
+        me = await get_user(x)
         u = await get_user(y)
-        link = f"@{u['username']}" if u["username"] else f'<a href="tg://user?id={y}">{esc(u["name"])}</a>'
+        if not u:
+            continue
         try:
-            await bot.send_photo(
-                x, u["photo"],
-                caption=f"🎉 <b>MATCH!</b>\n{esc(u['name'])} sizni ham yoqtirdi!\n\n💬 Yozing: {link}",
-            )
+            if has_premium(x, me):
+                await bot.send_photo(
+                    x, u["photo"],
+                    caption=f"🎉 <b>MATCH!</b>\n{esc(u['name'])} sizni ham yoqtirdi!\n\n💬 Shaxsiy chat: {user_link(u)}",
+                )
+            else:
+                await bot.send_photo(
+                    x, u["photo"],
+                    caption=(f"🎉 <b>MATCH!</b>\n{esc(u['name'])} sizni ham yoqtirdi!\n\n"
+                             "🔒 Shaxsiy chatga o'tish faqat 💎 PREMIUM foydalanuvchilar uchun."),
+                    reply_markup=ik([[("💎 Premium olish", "vipinfo")]]),
+                )
         except Exception:
             pass
 
@@ -378,8 +472,9 @@ async def act(cb: CallbackQuery):
     now = int(time.time())
 
     if action == "like":
-        if not is_vip(me) and await likes_today(uid) >= FREE_LIKES:
-            return await cb.answer(f"Kunlik limit ({FREE_LIKES}) tugadi. VIP olib limitsiz foydalaning 💎", show_alert=True)
+        limit = await int_setting("free_likes", FREE_LIKES)
+        if not has_premium(uid, me) and await likes_today(uid) >= limit:
+            return await cb.answer(f"Kunlik limit ({limit}) tugadi. VIP olib limitsiz foydalaning 💎", show_alert=True)
         await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "like", now))
         mutual = await q1("SELECT 1 FROM views WHERE from_id=? AND to_id=? AND action='like'", (tid, uid))
         if mutual:
@@ -400,8 +495,9 @@ async def act(cb: CallbackQuery):
         await ex("DELETE FROM saved WHERE user_id=? AND target_id=?", (uid, tid))
         await cb.answer("O'chirildi")
     elif action == "rep":
+        # shikoyat qilingan anketa qayta chiqmasligi uchun "kelajak" vaqti bilan yoziladi
         await ex("INSERT INTO reports(from_id,target_id,created) VALUES(?,?,?)", (uid, tid, now))
-        await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "skip", now))
+        await ex("INSERT OR REPLACE INTO views VALUES(?,?,?,?)", (uid, tid, "skip", now + 3650 * 86400))
         await cb.answer("🚨 Shikoyat yuborildi")
         for a in ADMINS:
             try:
@@ -418,6 +514,26 @@ async def act(cb: CallbackQuery):
         await show_next(uid, src)
     elif action == "like":
         await cb.answer("❤️")
+
+
+@r.callback_query(F.data.regexp(r"^dm:(\d+)$"))
+async def dm(cb: CallbackQuery):
+    uid = cb.from_user.id
+    me = await get_user(uid)
+    if not me:
+        return await cb.answer("Avval /start bosing", show_alert=True)
+    if not has_premium(uid, me):
+        await cb.answer("🔒 Shaxsiy chat faqat PREMIUM uchun", show_alert=True)
+        await cb.message.answer(
+            "🔒 <b>Shaxsiy chatga o'tish</b> faqat 💎 PREMIUM foydalanuvchilarga ochiq.\n\nPremium olib, xohlagan odamga yozing!",
+            reply_markup=ik([[("💎 Premium olish", "vipinfo")]]),
+        )
+        return
+    t = await get_user(int(cb.data.split(":")[1]))
+    if not t:
+        return await cb.answer("Foydalanuvchi topilmadi", show_alert=True)
+    await cb.answer()
+    await cb.message.answer(f"💬 {esc(t['name'])} bilan shaxsiy chat: {user_link(t)}")
 
 
 @r.callback_query(F.data == "back")
@@ -448,17 +564,11 @@ async def who_liked(m: Message):
            AND v.from_id NOT IN (SELECT to_id FROM views WHERE from_id=?)""", (uid, uid))
     if row["c"] == 0:
         return await m.answer("Hozircha yangi laykler yo'q. Anketangiz qidiruvda ko'rsatilmoqda 😉")
-    if is_vip(me) or uid in ADMINS:
+    if has_premium(uid, me):
         await m.answer(f"💘 Sizga {row['c']} kishi layk bosgan:")
         return await show_next(uid, "l")
     await m.answer(f"💘 Sizga <b>{row['c']}</b> kishi layk bosdi!\n\nKimligini ko'rish uchun 💎 VIP PREMIUM oling.",
                    reply_markup=ik([[("💎 VIP olish", "vipinfo")]]))
-
-
-@r.callback_query(F.data == "vipinfo")
-async def vipinfo_cb(cb: CallbackQuery):
-    await cb.answer()
-    await cb.message.answer(await get_setting("vip_text", DEFAULT_VIP_TEXT))
 
 
 # ---------- Saqlanganlar ----------
@@ -478,7 +588,7 @@ async def my_profile(m: Message):
     u = await get_user(m.from_user.id)
     if not u:
         return await m.answer("Avval /start bosing.")
-    vip = f"\n\n💎 VIP: {time.strftime('%d.%m.%Y', time.localtime(u['vip_until']))} gacha" if is_vip(u) else ""
+    vip = f"\n\n💎 VIP: {fmt_date(u['vip_until'])} gacha" if is_vip(u) else ""
     state = "🟢 Anketa faol" if u["active"] else "🔴 Anketa yashirilgan"
     kb = ik([
         [("✏️ Qayta to'ldirish", "p_edit")],
@@ -517,14 +627,154 @@ async def p_del_yes(cb: CallbackQuery):
     await cb.message.answer("🗑 Anketa o'chirildi. Qayta boshlash: /start", reply_markup=ReplyKeyboardRemove())
 
 
-# ---------- VIP ----------
+# ---------- VIP / TO'LOV ----------
+async def send_vip(target: Message, uid: int):
+    u = await get_user(uid)
+    if not u:
+        return await target.answer("Avval /start bosing.")
+    perks = await get_setting("vip_text", DEFAULT_VIP_TEXT)
+    head = ""
+    if is_vip(u):
+        head = f"✅ Sizda VIP faol: {fmt_date(u['vip_until'])} gacha\n\n"
+    promo = await valid_promo(uid, u["promo"])
+    rows = []
+    for k, (days, bonus, name) in PLANS.items():
+        label = f"{name} — {money(await price_of(k))} so'm"
+        if promo:
+            label += f" (+{bonus} kun 🎁)"
+        rows.append([(label, f"buy:{k}")])
+    rows.append([("🎟 Promokod kiritish", "promo")])
+    txt = head + perks + "\n\n👇 Tarifni tanlang:"
+    if promo:
+        txt += f"\n🎟 Promokod faol: <code>{esc(promo)}</code>"
+    await target.answer(txt, reply_markup=ik(rows))
+
+
+async def valid_promo(uid, code):
+    if not code:
+        return None
+    p = await q1("SELECT * FROM promos WHERE code=? AND active=1", (code,))
+    if not p:
+        return None
+    if p["max_uses"] > 0 and p["used"] >= p["max_uses"]:
+        return None
+    if await q1("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (uid, code)):
+        return None
+    return code
+
+
 @r.message(F.text == B_VIP, StateFilter(None))
 async def vip(m: Message):
-    u = await get_user(m.from_user.id)
-    txt = await get_setting("vip_text", DEFAULT_VIP_TEXT)
-    if is_vip(u):
-        txt = f"✅ Sizda VIP faol: {time.strftime('%d.%m.%Y', time.localtime(u['vip_until']))} gacha\n\n" + txt
-    await m.answer(txt)
+    await send_vip(m, m.from_user.id)
+
+
+@r.callback_query(F.data == "vipinfo")
+async def vipinfo_cb(cb: CallbackQuery):
+    await cb.answer()
+    await send_vip(cb.message, cb.from_user.id)
+
+
+@r.callback_query(F.data == "promo")
+async def promo_ask(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(Pay.promo)
+    await cb.message.answer("🎟 Promokodni yuboring:", reply_markup=rk([[B_CANCEL]]))
+
+
+@r.message(F.text == B_CANCEL, StateFilter(Pay.promo, Pay.receipt))
+async def pay_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Bekor qilindi.", reply_markup=main_kb())
+
+
+@r.message(Pay.promo, F.text)
+async def promo_enter(m: Message, state: FSMContext):
+    await state.clear()
+    code = m.text.strip().upper()
+    ok = await valid_promo(m.from_user.id, code)
+    if not ok:
+        await m.answer("❌ Promokod noto'g'ri yoki ishlatib bo'lingan.", reply_markup=main_kb())
+    else:
+        await ex("UPDATE users SET promo=? WHERE id=?", (code, m.from_user.id))
+        await m.answer("✅ Promokod qabul qilindi! Endi tarif tanlasangiz bonus kunlar qo'shiladi 🎁",
+                       reply_markup=main_kb())
+    await send_vip(m, m.from_user.id)
+
+
+@r.callback_query(F.data.regexp(r"^buy:[wmq]$"))
+async def buy(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    u = await get_user(uid)
+    if not u:
+        return await cb.answer("Avval /start bosing", show_alert=True)
+    if await q1("SELECT 1 FROM payments WHERE user_id=? AND status=0", (uid,)):
+        return await cb.answer("⏳ Oldingi to'lovingiz tekshirilmoqda. Admin javobini kuting.", show_alert=True)
+    plan = cb.data.split(":")[1]
+    days, bonus, name = PLANS[plan]
+    price = await price_of(plan)
+    promo = await valid_promo(uid, u["promo"])
+    card, holder = await get_card()
+    bonus_line = f"\n🎁 Promokod bonusi: <b>+{bonus} kun</b> (jami {days + bonus} kun)" if promo else ""
+    await state.set_state(Pay.receipt)
+    await state.update_data(plan=plan)
+    await cb.answer()
+    await cb.message.answer(
+        f"💎 <b>{name} PREMIUM</b> — {days} kun{bonus_line}\n\n"
+        f"💰 To'lov summasi: <b>{money(price)} so'm</b>\n"
+        f"💳 Karta: <code>{esc(card)}</code>\n"
+        f"👤 Qabul qiluvchi: <b>{esc(holder)}</b>\n\n"
+        "1️⃣ Yuqoridagi kartaga to'lov qiling\n"
+        "2️⃣ To'lov <b>chekining rasmini (skrinshot)</b> shu yerga yuboring\n"
+        "3️⃣ Admin tekshirib tasdiqlaydi — premium avtomatik beriladi ✅",
+        reply_markup=rk([[B_CANCEL]]),
+    )
+
+
+@r.message(Pay.receipt, F.photo)
+async def receipt(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    d = await state.get_data()
+    plan = d.get("plan")
+    await state.clear()
+    u = await get_user(uid)
+    if plan not in PLANS or not u:
+        return await m.answer("Xatolik. Qaytadan urinib ko'ring.", reply_markup=main_kb())
+    if await q1("SELECT 1 FROM payments WHERE user_id=? AND status=0", (uid,)):
+        return await m.answer("⏳ Oldingi to'lovingiz tekshirilmoqda.", reply_markup=main_kb())
+    days, bonus_days, name = PLANS[plan]
+    price = await price_of(plan)
+    promo = await valid_promo(uid, u["promo"])
+    bonus = bonus_days if promo else 0
+    cur = await ex_cur(
+        "INSERT INTO payments(user_id,plan,days,bonus,amount,promo,file_id,created) VALUES(?,?,?,?,?,?,?,?)",
+        (uid, plan, days, bonus, price, promo, m.photo[-1].file_id, int(time.time())),
+    )
+    pid = cur.lastrowid
+    await m.answer("✅ Chek qabul qilindi! Admin tekshirib, tez orada premiumni faollashtiradi. ⏳",
+                   reply_markup=main_kb())
+    p = await q1("SELECT * FROM payments WHERE id=?", (pid,))
+    for a in ADMINS:
+        try:
+            await bot.send_photo(a, p["file_id"], caption=pay_caption(p, u),
+                                 reply_markup=ik([[("✅ Tasdiqlash", f"pa:{pid}"), ("❌ Rad etish", f"pr:{pid}")]]))
+        except Exception:
+            pass
+
+
+@r.message(StateFilter(Pay.receipt))
+async def receipt_bad(m: Message):
+    await m.answer("Iltimos, to'lov chekining <b>rasmini</b> yuboring 📸 (yoki «Bekor qilish»).")
+
+
+def pay_caption(p, u) -> str:
+    tot = p["days"] + p["bonus"]
+    uname = f"@{u['username']}" if u and u["username"] else "—"
+    return (f"💳 <b>To'lov #{p['id']}</b>\n"
+            f"👤 {esc(u['name'] if u else '')} ({uname})\nID: <code>{p['user_id']}</code>\n"
+            f"📦 Tarif: {PLANS[p['plan']][2]} ({p['days']} kun"
+            + (f" + {p['bonus']} bonus = {tot} kun" if p["bonus"] else "") + ")\n"
+            f"💰 Summa: <b>{money(p['amount'])} so'm</b>\n"
+            f"🎟 Promokod: {esc(p['promo']) if p['promo'] else '—'}")
 
 
 # ---------- Anonim suhbat ----------
@@ -605,6 +855,10 @@ class Adm(StatesGroup):
     chan = State()
     find = State()
     viptext = State()
+    price = State()
+    card = State()
+    promo_add = State()
+    promo_del = State()
 
 
 adm = Router()
@@ -613,17 +867,22 @@ adm.callback_query.filter(F.from_user.id.in_(ADMINS))
 
 ADMIN_KB = ik([
     [("📊 Statistika", "a:stats"), ("📢 Xabar yuborish", "a:bc")],
+    [("💳 To'lovlar (kutilmoqda)", "a:pays"), ("💰 Daromad", "a:income")],
+    [("💎 VIP berish", "a:vip"), ("👑 VIP ro'yxati", "a:vips")],
+    [("🎟 Promokodlar", "a:promos"), ("💵 Narx va sozlamalar", "a:settings")],
+    [("💳 Karta ma'lumoti", "a:card"), ("✏️ VIP matni", "a:viptext")],
     [("🚫 Ban", "a:ban"), ("✅ Unban", "a:unban")],
-    [("💎 VIP berish", "a:vip"), ("🔎 Foydalanuvchi", "a:find")],
-    [("🚨 Shikoyatlar", "a:reports"), ("📌 Majburiy kanal", "a:chan")],
-    [("✏️ VIP matni", "a:viptext")],
+    [("🔎 Foydalanuvchi", "a:find"), ("🚨 Shikoyatlar", "a:reports")],
+    [("📌 Majburiy kanal", "a:chan")],
 ])
 
 
 @adm.message(Command("admin"))
 async def admin_cmd(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("🛠 <b>Admin panel</b>", reply_markup=ADMIN_KB)
+    n = (await q1("SELECT COUNT(*) c FROM payments WHERE status=0"))["c"]
+    extra = f"\n\n⏳ Kutilayotgan to'lovlar: <b>{n}</b>" if n else ""
+    await m.answer(f"🛠 <b>Admin panel</b>{extra}", reply_markup=ADMIN_KB)
 
 
 @adm.callback_query(F.data == "a:stats")
@@ -639,15 +898,151 @@ async def a_stats(cb: CallbackQuery):
     vips = (await c("SELECT COUNT(*) c FROM users WHERE vip_until>?", (now,)))["c"]
     banned = (await c("SELECT COUNT(*) c FROM users WHERE banned=1"))["c"]
     likes = (await c("SELECT COUNT(*) c FROM views WHERE action='like'"))["c"]
+    pend = (await c("SELECT COUNT(*) c FROM payments WHERE status=0"))["c"]
     matches = (await c(
         """SELECT COUNT(*) c FROM views a JOIN views b ON a.from_id=b.to_id AND a.to_id=b.from_id
            WHERE a.action='like' AND b.action='like' AND a.from_id<a.to_id"""))["c"]
     await cb.message.answer(
         f"📊 <b>Statistika</b>\n\n👥 Jami: {total}\n🟢 Faol: {active}\n👨 Yigit: {male} | 👩 Qiz: {female}\n"
         f"🆕 Bugun qo'shilgan: {today}\n💎 VIP: {vips}\n🚫 Banlangan: {banned}\n"
-        f"❤️ Laykler: {likes}\n🎉 Matchlar: {matches}\n💬 Suhbatda: {len(pairs)//2} juft | Kutmoqda: {len(waiting)}"
+        f"❤️ Laykler: {likes}\n🎉 Matchlar: {matches}\n⏳ Kutilayotgan to'lov: {pend}\n"
+        f"💬 Suhbatda: {len(pairs)//2} juft | Kutmoqda: {len(waiting)}"
     )
     await cb.answer()
+
+
+@adm.callback_query(F.data == "a:income")
+async def a_income(cb: CallbackQuery):
+    now = int(time.time())
+    day = now - now % 86400
+    tot = await q1("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM payments WHERE status=1")
+    td = await q1("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM payments WHERE status=1 AND created>=?", (day,))
+    wk = await q1("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM payments WHERE status=1 AND created>=?", (now - 7 * 86400,))
+    mo = await q1("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM payments WHERE status=1 AND created>=?", (now - 30 * 86400,))
+    rej = (await q1("SELECT COUNT(*) c FROM payments WHERE status=2"))["c"]
+    await cb.message.answer(
+        "💰 <b>Daromad</b>\n\n"
+        f"Bugun: {money(td['s'])} so'm ({td['c']} ta)\n"
+        f"7 kun: {money(wk['s'])} so'm ({wk['c']} ta)\n"
+        f"30 kun: {money(mo['s'])} so'm ({mo['c']} ta)\n"
+        f"Jami: <b>{money(tot['s'])} so'm</b> ({tot['c']} ta)\n"
+        f"❌ Rad etilgan: {rej}"
+    )
+    await cb.answer()
+
+
+@adm.callback_query(F.data == "a:vips")
+async def a_vips(cb: CallbackQuery):
+    rows = await qa("SELECT * FROM users WHERE vip_until>? ORDER BY vip_until DESC LIMIT 30", (int(time.time()),))
+    if not rows:
+        await cb.message.answer("💎 Hozircha VIP foydalanuvchilar yo'q.")
+    else:
+        lines = [f"• {esc(u['name'])} (<code>{u['id']}</code>) — {fmt_date(u['vip_until'])} gacha" for u in rows]
+        await cb.message.answer("👑 <b>VIP foydalanuvchilar</b>\n\n" + "\n".join(lines))
+    await cb.answer()
+
+
+# --- to'lovlarni tasdiqlash ---
+@adm.callback_query(F.data == "a:pays")
+async def a_pays(cb: CallbackQuery):
+    rows = await qa("SELECT * FROM payments WHERE status=0 ORDER BY id LIMIT 10")
+    if not rows:
+        await cb.message.answer("💳 Kutilayotgan to'lovlar yo'q.")
+    for p in rows:
+        u = await get_user(p["user_id"])
+        await cb.message.answer_photo(
+            p["file_id"], caption=pay_caption(p, u),
+            reply_markup=ik([[("✅ Tasdiqlash", f"pa:{p['id']}"), ("❌ Rad etish", f"pr:{p['id']}")]]))
+    await cb.answer()
+
+
+@adm.callback_query(F.data.regexp(r"^(pa|pr):(\d+)$"))
+async def a_pay_act(cb: CallbackQuery):
+    act_, pid = cb.data.split(":")
+    pid = int(pid)
+    new = 1 if act_ == "pa" else 2
+    cur = await ex_cur("UPDATE payments SET status=?, handled_by=? WHERE id=? AND status=0",
+                       (new, cb.from_user.id, pid))
+    if cur.rowcount == 0:
+        await cb.answer("Bu to'lov allaqachon ko'rib chiqilgan.", show_alert=True)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    p = await q1("SELECT * FROM payments WHERE id=?", (pid,))
+    uid = p["user_id"]
+    if new == 1:
+        total = p["days"] + p["bonus"]
+        until = await grant_vip(uid, total)
+        if p["promo"]:
+            await ex("INSERT OR IGNORE INTO promo_uses VALUES(?,?)", (uid, p["promo"]))
+            await ex("UPDATE promos SET used=used+1 WHERE code=?", (p["promo"],))
+            await ex("UPDATE users SET promo=NULL WHERE id=? AND promo=?", (uid, p["promo"]))
+        try:
+            await bot.send_message(
+                uid,
+                f"🎉 <b>To'lov tasdiqlandi!</b>\n\n💎 Sizga {total} kunlik PREMIUM berildi."
+                f"\n📅 Amal qilish muddati: {fmt_date(until)} gacha\n\n"
+                "Endi kim layk bosganini ko'rasiz va shaxsiy chatga o'ta olasiz 💬",
+                reply_markup=main_kb())
+        except Exception:
+            pass
+        mark = "✅ TASDIQLANDI"
+    else:
+        try:
+            await bot.send_message(
+                uid, "❌ <b>To'lovingiz rad etildi.</b>\n\nChek noto'g'ri yoki to'lov topilmadi. "
+                     "Qayta urinib ko'ring: «💎 VIP PREMIUM» bo'limi.", reply_markup=main_kb())
+        except Exception:
+            pass
+        mark = "❌ RAD ETILDI"
+    await cb.answer("Bajarildi")
+    try:
+        await cb.message.edit_caption(caption=(cb.message.caption or "") + f"\n\n<b>{mark}</b> ({cb.from_user.first_name})",
+                                      reply_markup=None)
+    except Exception:
+        pass
+
+
+# --- promokodlar ---
+@adm.callback_query(F.data == "a:promos")
+async def a_promos(cb: CallbackQuery):
+    rows = await qa("SELECT * FROM promos ORDER BY rowid DESC LIMIT 30")
+    lines = [f"• <code>{esc(p['code'])}</code> — {p['used']}/{p['max_uses'] or '∞'}" for p in rows] or ["(hali yo'q)"]
+    await cb.message.answer(
+        "🎟 <b>Promokodlar</b> (ishlatilgan/limit)\n\n" + "\n".join(lines) +
+        "\n\n🎁 Bonus: 1 hafta +3 kun, 1 oy +4 kun, 3 oy +5 kun",
+        reply_markup=ik([[("➕ Qo'shish", "a:promo_add"), ("🗑 O'chirish", "a:promo_del")]]))
+    await cb.answer()
+
+
+# --- narx va sozlamalar ---
+@adm.callback_query(F.data == "a:settings")
+async def a_settings(cb: CallbackQuery, state: FSMContext):
+    lk = await int_setting("free_likes", FREE_LIKES)
+    rc = await int_setting("recycle_days", DEFAULT_RECYCLE_DAYS)
+    await state.set_state(Adm.price)
+    await cb.message.answer(
+        "💵 <b>Narxlar va sozlamalar</b>\n\n"
+        f"w — 1 hafta: {money(await price_of('w'))} so'm\n"
+        f"m — 1 oy: {money(await price_of('m'))} so'm\n"
+        f"q — 3 oy: {money(await price_of('q'))} so'm\n"
+        f"likes — kunlik bepul layk: {lk}\n"
+        f"recycle — anketa qayta chiqish (kun): {rc}\n\n"
+        "O'zgartirish uchun yuboring: <code>KALIT QIYMAT</code>\n"
+        "Masalan: <code>m 45000</code> yoki <code>likes 30</code>\n\nBekor qilish: /admin")
+    await cb.answer()
+
+
+@adm.message(Adm.price)
+async def s_price(m: Message, state: FSMContext):
+    parts = (m.text or "").split()
+    keys = {"w": "price_w", "m": "price_m", "q": "price_q", "likes": "free_likes", "recycle": "recycle_days"}
+    if len(parts) != 2 or parts[0] not in keys or not parts[1].isdigit():
+        return await m.answer("Format: <code>KALIT QIYMAT</code> (w, m, q, likes, recycle)")
+    await set_setting(keys[parts[0]], parts[1])
+    await m.answer(f"✅ Saqlandi: {parts[0]} = {parts[1]}\nYana o'zgartirish mumkin yoki /admin")
 
 
 PROMPTS = {
@@ -658,16 +1053,51 @@ PROMPTS = {
     "find": ("🔎 User ID yuboring:", Adm.find),
     "chan": ("📌 Kanal username yuboring (masalan <code>@kanal</code>) yoki <code>off</code>. Bot kanalda admin bo'lishi shart.", Adm.chan),
     "viptext": ("✏️ VIP bo'limi uchun yangi matnni yuboring (HTML mumkin):", Adm.viptext),
+    "card": ("💳 Format: <code>KARTA RAQAMI | Ism Familiya</code>\nMasalan: <code>6262 5701 3419 2691 | Boratova Zarnigir</code>", Adm.card),
+    "promo_add": ("➕ Format: <code>KOD LIMIT</code> (LIMIT=0 — cheksiz). Masalan: <code>YANGI 100</code>", Adm.promo_add),
+    "promo_del": ("🗑 O'chiriladigan promokodni yuboring:", Adm.promo_del),
 }
 
 
-@adm.callback_query(F.data.regexp(r"^a:(bc|ban|unban|vip|find|chan|viptext)$"))
+@adm.callback_query(F.data.regexp(r"^a:(bc|ban|unban|vip|find|chan|viptext|card|promo_add|promo_del)$"))
 async def a_prompt(cb: CallbackQuery, state: FSMContext):
     key = cb.data.split(":")[1]
     txt, st = PROMPTS[key]
     await state.set_state(st)
     await cb.message.answer(txt + "\n\nBekor qilish: /admin")
     await cb.answer()
+
+
+@adm.message(Adm.card)
+async def s_card(m: Message, state: FSMContext):
+    if "|" not in (m.text or ""):
+        return await m.answer("Format: <code>KARTA | Ism Familiya</code>")
+    num, holder = [x.strip() for x in m.text.split("|", 1)]
+    await state.clear()
+    await set_setting("card", num)
+    await set_setting("holder", holder)
+    await m.answer(f"✅ Karta yangilandi:\n<code>{esc(num)}</code>\n{esc(holder)}")
+
+
+@adm.message(Adm.promo_add)
+async def s_promo_add(m: Message, state: FSMContext):
+    parts = (m.text or "").split()
+    if not parts or len(parts) > 2 or (len(parts) == 2 and not parts[1].isdigit()):
+        return await m.answer("Format: <code>KOD LIMIT</code>")
+    code = parts[0].upper()
+    limit = int(parts[1]) if len(parts) == 2 else 0
+    await state.clear()
+    await ex("INSERT OR REPLACE INTO promos(code,max_uses,used,active) VALUES(?,?,COALESCE((SELECT used FROM promos WHERE code=?),0),1)",
+             (code, limit, code))
+    await m.answer(f"✅ Promokod qo'shildi: <code>{esc(code)}</code> (limit: {limit or '∞'})")
+
+
+@adm.message(Adm.promo_del)
+async def s_promo_del(m: Message, state: FSMContext):
+    await state.clear()
+    code = (m.text or "").strip().upper()
+    await ex("DELETE FROM promos WHERE code=?", (code,))
+    await m.answer(f"🗑 O'chirildi: <code>{esc(code)}</code>")
 
 
 @adm.message(Adm.bc)
@@ -729,9 +1159,7 @@ async def s_vip(m: Message, state: FSMContext):
     if days <= 0:
         await ex("UPDATE users SET vip_until=0 WHERE id=?", (uid,))
         return await m.answer("VIP olib tashlandi.")
-    base = max(u["vip_until"], int(time.time()))
-    until = base + days * 86400
-    await ex("UPDATE users SET vip_until=? WHERE id=?", (until, uid))
+    await grant_vip(uid, days)
     await m.answer(f"💎 {uid} ga {days} kunlik VIP berildi.")
     try:
         await bot.send_message(uid, f"🎉 Sizga {days} kunlik 💎 VIP berildi!")
@@ -808,11 +1236,6 @@ async def a_report_act(cb: CallbackQuery):
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-
-
-@adm.callback_query(F.data == "a:chan_dummy")
-async def _dummy(cb: CallbackQuery):
-    await cb.answer()
 
 
 # ---------- Ishga tushirish ----------
